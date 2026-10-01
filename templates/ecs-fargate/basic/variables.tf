@@ -38,7 +38,7 @@ variable "image" {
   }
 }
 
-# Set by the Infra Space (spaces/<infra_id>.tfvars.json).
+# Set by the Infra Space (infra values in the backend's GET /api/plans/{plan_id} response).
 
 variable "vpc_id" {
   type = string

@@ -39,7 +39,7 @@ ALB와 Target Group은 이름이 32자로 제한돼서 짧은 형식을 씁니�
 | `image` | string | 필수 | `<저장소>@sha256:<digest>` |
 | `region` | string | `ap-northeast-2` | 리전 |
 
-### 인프라 Space가 주는 값 (`spaces/<infra_id>.tfvars.json`)
+### 인프라 Space가 주는 값 (백엔드 `GET /api/plans/{plan_id}`의 `infra`)
 
 | 속성 | 타입 | 기본값 | 역할 |
 |---|---|---|---|
