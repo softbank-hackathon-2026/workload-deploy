@@ -1,0 +1,34 @@
+# Checks the Terraform templates: format, validate and mock-provider tests. No AWS access.
+name: Validate
+
+on:
+  push:
+    branches: [main]
+    paths: ["templates/**", ".github/workflows/validate.yml"]
+  pull_request:
+    paths: ["templates/**", ".github/workflows/validate.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        template: [ecs-fargate/basic]
+    defaults:
+      run:
+        working-directory: templates/${{ matrix.template }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      - run: terraform test
