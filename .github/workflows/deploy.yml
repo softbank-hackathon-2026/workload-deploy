@@ -1,0 +1,184 @@
+# User app deployment to a Workload Space (ADR-009).
+# The platform backend starts this with workflow_dispatch. Each stage reports to the backend callback (API spec 9-3, 9-4).
+# Step 1 of the plan: inputs, build and callbacks. The deploy job is a placeholder until the Workload connection (step 3).
+name: Deploy
+run-name: deploy ${{ inputs.deployment_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: Deployment ID issued by the backend (lowercase, digits, hyphens)
+        required: true
+      application_id:
+        description: App Space ID
+        required: true
+      repo:
+        description: Public GitHub repo of the user app (owner/name)
+        required: true
+      commit_sha:
+        description: Full commit SHA to deploy
+        required: true
+      infra_id:
+        description: Infra Space ID
+        required: true
+      compute:
+        description: Compute type (only ecs-fargate for now)
+        required: true
+        default: ecs-fargate
+      callback_url:
+        description: Backend callback URL. Empty skips callbacks.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# Explicit bash adds pipefail, so a failing docker save is not hidden by gzip.
+defaults:
+  run:
+    shell: bash
+
+# One deployment at a time across the whole service (ADR-011). Never cancel a deployment in progress.
+concurrency:
+  group: workload-deploy
+  cancel-in-progress: false
+
+env:
+  CALLBACK_BASE: https://sbh.howon.me/api/deployments/
+  DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+  CALLBACK_URL: ${{ inputs.callback_url }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Inputs come from the backend but are checked here too, since they reach shell commands and AWS resource names.
+      - name: Validate inputs
+        env:
+          APPLICATION_ID: ${{ inputs.application_id }}
+          REPO: ${{ inputs.repo }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          INFRA_ID: ${{ inputs.infra_id }}
+          COMPUTE: ${{ inputs.compute }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$DEPLOYMENT_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "deployment_id must be lowercase letters, digits and hyphens"
+          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "application_id must be lowercase letters, digits and hyphens"
+          [[ "$INFRA_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "infra_id must be lowercase letters, digits and hyphens"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo must be owner/name"
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character SHA"
+          [[ "$COMPUTE" == "ecs-fargate" ]] || fail "compute $COMPUTE is not supported yet"
+          if [[ -n "$CALLBACK_URL" && "$CALLBACK_URL" != "${CALLBACK_BASE}${DEPLOYMENT_ID}/callback" ]]; then
+            fail "callback_url must be ${CALLBACK_BASE}<deployment_id>/callback"
+          fi
+
+      - name: Report prepare and build start
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+        run: |
+          python3 scripts/callback.py prepare "배포를 준비하고 있습니다." --run-id "$GITHUB_RUN_ID"
+          python3 scripts/callback.py build "앱 이미지를 빌드하고 있습니다."
+
+  # Runs the user's code (docker build), so it gets no secrets and no AWS access.
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.commit_sha }}
+          path: app
+          persist-credentials: false
+
+      - name: Build image
+        env:
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/reasons"
+          if [[ ! -f app/Dockerfile ]]; then
+            echo "Dockerfile이 없어 지원하지 않는 형식입니다." > "$RUNNER_TEMP/reasons/build.txt"
+            echo "::error::Dockerfile not found at the repository root"
+            exit 1
+          fi
+          docker build -t "app:$COMMIT_SHA" app
+          docker save "app:$COMMIT_SHA" | gzip > "$RUNNER_TEMP/image.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: ${{ runner.temp }}/image.tar.gz
+          retention-days: 1
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-build
+          path: ${{ runner.temp }}/reasons/
+          if-no-files-found: ignore
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      app_url: ${{ steps.deploy.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report deploy start
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+        run: python3 scripts/callback.py deploy "Workload에 배포하고 있습니다."
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      # TODO(step 3): push the image to Workload ECR, terraform apply templates/ecs-fargate/basic, then verify.
+      - name: Deploy
+        id: deploy
+        run: |
+          mkdir -p "$RUNNER_TEMP/reasons"
+          echo "Workload 배포 단계가 아직 연결되지 않았습니다." > "$RUNNER_TEMP/reasons/deploy.txt"
+          echo "::error::Deploy stage is not implemented yet (plan step 3)"
+          exit 1
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-deploy
+          path: ${{ runner.temp }}/reasons/
+          if-no-files-found: ignore
+
+  # Always sends the final result, including failures and cancellations.
+  report:
+    needs: [prepare, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: reason-*
+          merge-multiple: true
+          path: reasons
+
+      - name: Report final result
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          APP_URL: ${{ needs.deploy.outputs.app_url }}
+          REASONS_DIR: reasons
+        run: python3 scripts/callback.py final
