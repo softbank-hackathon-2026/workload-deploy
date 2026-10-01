@@ -53,7 +53,7 @@ deploy 단계에서 `status=deploying`, `step=deploy`와 함께 `resources` 배�
 
 | 이름 | 용도 | 상태 |
 |---|---|---|
-| `DEPLOY_CALLBACK_SECRET` | 콜백 서명 키. 플랫폼 Parameter Store `/sbh/platform/demo/backend/DEPLOY_CALLBACK_SECRET`와 같은 값 | 미등록 (없으면 콜백 생략) |
+| `DEPLOY_CALLBACK_SECRET` | 콜백 서명 키. 플랫폼 Parameter Store `/sbh/platform/demo/backend/DEPLOY_CALLBACK_SECRET`와 같은 값 | 등록됨 (2026-10-02) |
 | `WORKLOAD_AWS_ACCESS_KEY_ID`, `WORKLOAD_AWS_SECRET_ACCESS_KEY` | Workload 계정 키(정호원님 발급). deploy·destroy에서만 사용, 계정 `921810471078`이 아니면 멈춤 | 미등록 |
 
 ## 진행 상황
