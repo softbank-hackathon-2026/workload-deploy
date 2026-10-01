@@ -1,6 +1,5 @@
 # User app deployment to a Workload Space (ADR-009).
 # The platform backend starts this with workflow_dispatch. Each stage reports to the backend callback (API spec 9-3, 9-4).
-# Step 1 of the plan: inputs, build and callbacks. The deploy job is a placeholder until the Workload connection (step 3).
 name: Deploy
 run-name: deploy ${{ inputs.deployment_id }}
 
@@ -26,6 +25,14 @@ on:
         description: Compute type (only ecs-fargate for now)
         required: true
         default: ecs-fargate
+      plan_id:
+        description: Plan chosen in the backend (template + values). Empty uses the default template.
+        required: false
+        default: ""
+      test_plan:
+        description: 'Test only, when plan_id is empty. Same shape as the backend plan: {"values": {...}, "infra": {"vpc_id": "...", "public_subnet_ids": ["...", "..."]}}'
+        required: false
+        default: ""
       callback_url:
         description: Backend callback URL. Empty skips callbacks.
         required: false
@@ -34,7 +41,7 @@ on:
 permissions:
   contents: read
 
-# Explicit bash adds pipefail, so a failing docker save is not hidden by gzip.
+# Explicit bash adds pipefail, so a failing step in a pipe (docker save, terraform apply) is not hidden.
 defaults:
   run:
     shell: bash
@@ -45,6 +52,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  AWS_REGION: ap-northeast-2
+  WORKLOAD_ACCOUNT_ID: "921810471078"
+  ECR_REPOSITORY: sbh-workload-demo-ecr-apps
+  API_BASE: https://sbh.howon.me/api
   CALLBACK_BASE: https://sbh.howon.me/api/deployments/
   DEPLOYMENT_ID: ${{ inputs.deployment_id }}
   CALLBACK_URL: ${{ inputs.callback_url }}
@@ -64,11 +75,13 @@ jobs:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           INFRA_ID: ${{ inputs.infra_id }}
           COMPUTE: ${{ inputs.compute }}
+          PLAN_ID: ${{ inputs.plan_id }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
           [[ "$DEPLOYMENT_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "deployment_id must be lowercase letters, digits and hyphens"
-          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "application_id must be lowercase letters, digits and hyphens"
+          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || fail "application_id must be 1-24 lowercase letters, digits and hyphens"
           [[ "$INFRA_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "infra_id must be lowercase letters, digits and hyphens"
+          [[ -z "$PLAN_ID" || "$PLAN_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "plan_id must be lowercase letters, digits and hyphens"
           [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo must be owner/name"
           [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character SHA"
           [[ "$COMPUTE" == "ecs-fargate" ]] || fail "compute $COMPUTE is not supported yet"
@@ -122,42 +135,161 @@ jobs:
           path: ${{ runner.temp }}/reasons/
           if-no-files-found: ignore
 
+  # Each risky step writes its failure reason first and removes it on success,
+  # so a failed step leaves reasons/deploy.txt behind for the final callback.
   deploy:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
-      app_url: ${{ steps.deploy.outputs.app_url }}
+      app_url: ${{ steps.apply.outputs.app_url }}
+    env:
+      APPLICATION_ID: ${{ inputs.application_id }}
+      INFRA_ID: ${{ inputs.infra_id }}
+      COMMIT_SHA: ${{ inputs.commit_sha }}
+      COMPUTE: ${{ inputs.compute }}
+      DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+      REASONS: ${{ github.workspace }}/reasons
     steps:
       - uses: actions/checkout@v4
 
       - name: Report deploy start
-        env:
-          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
-        run: python3 scripts/callback.py deploy "Workload에 배포하고 있습니다."
+        run: |
+          mkdir -p "$REASONS"
+          python3 scripts/callback.py deploy "Workload에 배포하고 있습니다."
 
       - uses: actions/download-artifact@v4
         with:
           name: image
           path: ${{ runner.temp }}
 
-      # TODO(step 3): push the image to Workload ECR, then in templates/ecs-fargate/basic:
-      #   terraform plan -out=tfplan && terraform show -json tfplan | python3 scripts/callback.py plan-resources
-      #   terraform apply -json tfplan | python3 scripts/callback.py apply-events   (pipefail keeps apply's exit code)
-      # and send the verify callback after checking app_url.
-      - name: Deploy
-        id: deploy
+      # Keys issued by the infra owner for the Workload account (ADR-009). Any other account is refused.
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.WORKLOAD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.WORKLOAD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.WORKLOAD_ACCOUNT_ID }}
+
+      # ponytail: created on first use with the CLI instead of a separate bootstrap stack. Idempotent.
+      - name: Prepare state bucket and image repository
+        id: base
         run: |
-          mkdir -p "$RUNNER_TEMP/reasons"
-          echo "Workload 배포 단계가 아직 연결되지 않았습니다." > "$RUNNER_TEMP/reasons/deploy.txt"
-          echo "::error::Deploy stage is not implemented yet (plan step 3)"
-          exit 1
+          echo "Workload 기본 자원(State 버킷, 이미지 저장소)을 준비하지 못했습니다." > "$REASONS/deploy.txt"
+          BUCKET="sbh-workload-demo-s3-tfstate-${WORKLOAD_ACCOUNT_ID}"
+          TAGS="Project=SBH,Scope=workload,Environment=demo,ManagedBy=github-actions,Owner=박소정"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+            aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
+            aws s3api put-bucket-tagging --bucket "$BUCKET" --tagging \
+              "TagSet=[{Key=Name,Value=$BUCKET},{Key=Project,Value=SBH},{Key=Scope,Value=workload},{Key=Environment,Value=demo},{Key=ManagedBy,Value=github-actions},{Key=Owner,Value=박소정}]"
+          fi
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "$ECR_REPOSITORY" --image-tag-mutability IMMUTABLE \
+              --tags "Key=Name,Value=$ECR_REPOSITORY" Key=Project,Value=SBH Key=Scope,Value=workload \
+                Key=Environment,Value=demo Key=ManagedBy,Value=github-actions "Key=Owner,Value=박소정" >/dev/null
+          fi
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          rm "$REASONS/deploy.txt"
+
+      # Tags are never overwritten. The same app and commit reuse the image already pushed.
+      - name: Push image
+        id: image
+        run: |
+          echo "이미지를 Workload 이미지 저장소에 올리지 못했습니다." > "$REASONS/deploy.txt"
+          REGISTRY="${WORKLOAD_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          TAG="${APPLICATION_ID}-${COMMIT_SHA}"
+          if ! aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+            docker load -i "$RUNNER_TEMP/image.tar.gz"
+            docker tag "app:$COMMIT_SHA" "$REGISTRY/$ECR_REPOSITORY:$TAG"
+            docker push "$REGISTRY/$ECR_REPOSITORY:$TAG"
+          fi
+          DIGEST=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "image=$REGISTRY/$ECR_REPOSITORY@$DIGEST" >> "$GITHUB_OUTPUT"
+          rm "$REASONS/deploy.txt"
+
+      - name: Prepare Terraform variables
+        id: vars
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          PLAN_ID: ${{ inputs.plan_id }}
+          TEST_PLAN: ${{ inputs.test_plan }}
+          REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
+        run: |
+          TEMPLATE=$(python3 scripts/plan.py "$RUNNER_TEMP/app.tfvars.json")
+          echo "template=$TEMPLATE" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform plan
+        working-directory: templates/${{ steps.vars.outputs.template }}
+        env:
+          BUCKET: ${{ steps.base.outputs.bucket }}
+          TEMPLATE: ${{ steps.vars.outputs.template }}
+        run: |
+          echo "배포 구성 값이 템플릿 검사를 통과하지 못했거나 plan에 실패했습니다." > "$REASONS/deploy.txt"
+          terraform init -input=false -backend-config="bucket=$BUCKET" \
+            -backend-config="key=apps/$APPLICATION_ID/terraform.tfstate" -backend-config="region=$AWS_REGION"
+          terraform plan -input=false -out=tfplan -var-file="$RUNNER_TEMP/app.tfvars.json"
+          # Saved before apply so a half-applied app can still be destroyed (destroy.yml).
+          aws s3 cp "$RUNNER_TEMP/app.tfvars.json" "s3://$BUCKET/apps/$APPLICATION_ID/app.tfvars.json"
+          printf '%s' "$TEMPLATE" | aws s3 cp - "s3://$BUCKET/apps/$APPLICATION_ID/template"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/callback.py" plan-resources
+          rm "$REASONS/deploy.txt"
+
+      # apply waits until the new task is healthy (wait_for_steady_state), then reports each resource as it goes.
+      - name: Terraform apply
+        id: apply
+        working-directory: templates/${{ steps.vars.outputs.template }}
+        run: |
+          echo "자원을 만드는 중 실패했습니다(terraform apply)." > "$REASONS/deploy.txt"
+          terraform apply -input=false -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/callback.py" apply-events
+          {
+            echo "app_url=$(terraform output -raw app_url)"
+            echo "task_definition_arn=$(terraform output -raw task_definition_arn)"
+            echo "cluster=$(terraform output -raw cluster_name)"
+            echo "service=$(terraform output -raw service_name)"
+          } >> "$GITHUB_OUTPUT"
+          rm "$REASONS/deploy.txt"
+
+      - name: Verify
+        env:
+          APP_URL: ${{ steps.apply.outputs.app_url }}
+          TASK_DEFINITION_ARN: ${{ steps.apply.outputs.task_definition_arn }}
+          CLUSTER: ${{ steps.apply.outputs.cluster }}
+          SERVICE: ${{ steps.apply.outputs.service }}
+        run: |
+          echo verify > "$REASONS/deploy.step"
+          python3 scripts/callback.py verify "앱이 정상 응답하는지 확인하고 있습니다."
+
+          # The circuit breaker may have rolled back to an older revision while the service still looks stable.
+          echo "서비스가 이번 버전으로 실행되지 않았습니다(자동 롤백)." > "$REASONS/deploy.txt"
+          RUNNING=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'] | [0].taskDefinition" --output text)
+          [[ "$RUNNING" == "$TASK_DEFINITION_ARN" ]] || { echo "::error::service runs $RUNNING"; exit 1; }
+
+          # A new ALB name can take a minute or two to resolve.
+          echo "앱 주소가 제한 시간 안에 응답하지 않았습니다." > "$REASONS/deploy.txt"
+          for i in $(seq 1 30); do
+            CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 5 "$APP_URL/" || true)
+            echo "attempt $i: HTTP $CODE"
+            [[ "$CODE" == "200" ]] && break
+            sleep 10
+          done
+          [[ "$CODE" == "200" ]] || exit 1
+          rm "$REASONS/deploy.txt" "$REASONS/deploy.step"
 
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: reason-deploy
-          path: ${{ runner.temp }}/reasons/
+          path: ${{ github.workspace }}/reasons/
           if-no-files-found: ignore
 
   # Always sends the final result, including failures and cancellations.

@@ -1,0 +1,75 @@
+# Removes one deployed user app (all resources in its Terraform state). Run by hand to stop costs after tests.
+name: Destroy
+run-name: destroy ${{ inputs.application_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      application_id:
+        description: App Space ID to remove
+        required: true
+      confirm:
+        description: Type the application_id again to confirm
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Same group as Deploy, so a destroy never runs in the middle of a deployment.
+concurrency:
+  group: workload-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  WORKLOAD_ACCOUNT_ID: "921810471078"
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APPLICATION_ID: ${{ inputs.application_id }}
+      CONFIRM: ${{ inputs.confirm }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || { echo "::error::application_id must be 1-24 lowercase letters, digits and hyphens"; exit 1; }
+          [[ "$CONFIRM" == "$APPLICATION_ID" ]] || { echo "::error::confirm does not match application_id"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.WORKLOAD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.WORKLOAD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ env.WORKLOAD_ACCOUNT_ID }}
+
+      # Deploy saved the variables and template name next to the state.
+      - name: Load saved variables
+        id: saved
+        run: |
+          BUCKET="sbh-workload-demo-s3-tfstate-${WORKLOAD_ACCOUNT_ID}"
+          aws s3 cp "s3://$BUCKET/apps/$APPLICATION_ID/app.tfvars.json" "$RUNNER_TEMP/app.tfvars.json"
+          TEMPLATE=$(aws s3 cp "s3://$BUCKET/apps/$APPLICATION_ID/template" -)
+          [[ "$TEMPLATE" =~ ^[a-z0-9-]+/[a-z0-9-]+$ && -d "templates/$TEMPLATE" ]] || { echo "::error::unknown template $TEMPLATE"; exit 1; }
+          echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "template=$TEMPLATE" >> "$GITHUB_OUTPUT"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform destroy
+        working-directory: templates/${{ steps.saved.outputs.template }}
+        env:
+          BUCKET: ${{ steps.saved.outputs.bucket }}
+        run: |
+          terraform init -input=false -backend-config="bucket=$BUCKET" \
+            -backend-config="key=apps/$APPLICATION_ID/terraform.tfstate" -backend-config="region=$AWS_REGION"
+          terraform destroy -input=false -auto-approve -var-file="$RUNNER_TEMP/app.tfvars.json"

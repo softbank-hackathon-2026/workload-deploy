@@ -54,13 +54,18 @@ def final_body(results, reasons_dir, app_url=None):
         if result == "success":
             continue
         reason_file = Path(reasons_dir) / f"{job}.txt"
+        # A job can name the exact step that failed (e.g. verify inside the deploy job).
+        step_file = Path(reasons_dir) / f"{job}.step"
+        step = step_file.read_text(encoding="utf-8").strip() if step_file.is_file() else job
         if result == "cancelled":
             reason = "배포가 취소되었습니다."
         elif reason_file.is_file():
             reason = reason_file.read_text(encoding="utf-8").strip()
         else:
             reason = DEFAULT_REASONS[job]
-        return make_body(job, f"{job} 단계에서 멈췄습니다.", reason=reason)
+        if step not in STATUS_BY_STEP or step == "done":
+            step = job
+        return make_body(step, f"{step} 단계에서 멈췄습니다.", reason=reason)
     return make_body("done", "배포가 완료되었습니다.", url=app_url)
 
 
@@ -181,6 +186,12 @@ def self_test():
         assert (failed["step"], failed["status"], failed["reason"]) == ("build", "failed", "Dockerfile이 없습니다.")
         assert final_body({"prepare": "failure"}, d)["reason"] == DEFAULT_REASONS["prepare"]
         assert final_body({"prepare": "success", "build": "cancelled"}, d)["reason"] == "배포가 취소되었습니다."
+        Path(d, "deploy.txt").write_text("앱이 응답하지 않습니다.", encoding="utf-8")
+        Path(d, "deploy.step").write_text("verify\n", encoding="utf-8")
+        v = final_body({"prepare": "success", "build": "success", "deploy": "failure"}, d)
+        assert (v["step"], v["status"], v["reason"]) == ("verify", "failed", "앱이 응답하지 않습니다."), v
+        Path(d, "deploy.step").write_text("bogus", encoding="utf-8")
+        assert final_body({"prepare": "success", "build": "success", "deploy": "failure"}, d)["step"] == "deploy"
 
     plan = {"resource_changes": [
         {"address": "aws_lb.app", "mode": "managed", "type": "aws_lb", "change": {"actions": ["create"]}},

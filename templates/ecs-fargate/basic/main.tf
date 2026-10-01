@@ -181,5 +181,11 @@ resource "aws_ecs_service" "app" {
 
   tags = { DeploymentId = var.deployment_id }
 
+  # Fail well inside the pipeline's 20-minute deploy job instead of waiting on a task that never gets healthy.
+  timeouts {
+    create = "10m"
+    update = "10m"
+  }
+
   depends_on = [aws_lb_listener.http, aws_iam_role_policy_attachment.execution]
 }
