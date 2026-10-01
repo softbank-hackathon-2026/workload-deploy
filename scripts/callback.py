@@ -39,7 +39,7 @@ def sign(secret: str, body: bytes) -> str:
 def make_body(step, message, run_id=None, url=None, reason=None):
     body = {"status": "failed" if reason else STATUS_BY_STEP[step], "step": step, "message": message}
     if run_id:
-        body["run_id"] = run_id
+        body["run_id"] = int(run_id)  # API spec 9-4 sends the Actions run ID as a number
     if url:
         body["url"] = url
     if reason:
@@ -167,7 +167,7 @@ def self_test():
     assert sign("key", b"The quick brown fox jumps over the lazy dog") == (
         "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
     )
-    assert make_body("prepare", "m", run_id="1") == {"status": "pending", "step": "prepare", "message": "m", "run_id": "1"}
+    assert make_body("prepare", "m", run_id="1") == {"status": "pending", "step": "prepare", "message": "m", "run_id": 1}
     assert make_body("verify", "m")["status"] == "deploying"
     assert make_body("build", "m", reason="x")["status"] == "failed"
 
