@@ -40,12 +40,13 @@ deploy 단계에서 `status=deploying`, `step=deploy`와 함께 `resources` 배�
 | 이름 | 용도 | 상태 |
 |---|---|---|
 | `DEPLOY_CALLBACK_SECRET` | 콜백 서명 키. 플랫폼 Parameter Store `/sbh/platform/demo/backend/DEPLOY_CALLBACK_SECRET`와 같은 값 | 미등록 (없으면 콜백 생략) |
-| Workload 액세스 키 | deploy job에서만 사용 | 3단계 |
+| Workload 액세스 키 | deploy job에서만 사용 (정호원님 발급) | 미등록 (3단계) |
 
 ## 진행 상황
 
 - [x] 1단계: 입력값, build job, 콜백
-- [ ] 2단계: `templates/ecs-fargate/basic/` Terraform 양식
+- [x] 2단계: `templates/ecs-fargate/basic/` Terraform 양식
+- [x] 자원별 콜백 코드 (트리용, 3단계에서 deploy job에 연결)
 - [ ] 3단계: Workload 연결 (ECR 업로드, plan/apply, 동작 확인)
 - [ ] 4단계: 백엔드 연결
 - [ ] 5단계: 검증
