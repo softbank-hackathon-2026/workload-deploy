@@ -141,7 +141,10 @@ jobs:
           name: image
           path: ${{ runner.temp }}
 
-      # TODO(step 3): push the image to Workload ECR, terraform apply templates/ecs-fargate/basic, then verify.
+      # TODO(step 3): push the image to Workload ECR, then in templates/ecs-fargate/basic:
+      #   terraform plan -out=tfplan && terraform show -json tfplan | python3 scripts/callback.py plan-resources
+      #   terraform apply -json tfplan | python3 scripts/callback.py apply-events   (pipefail keeps apply's exit code)
+      # and send the verify callback after checking app_url.
       - name: Deploy
         id: deploy
         run: |

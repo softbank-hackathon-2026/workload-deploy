@@ -21,6 +21,20 @@
 `POST https://sbh.howon.me/api/deployments/{deployment_id}/callback`, 헤더 `X-Hub-Signature-256: sha256=<본문 HMAC-SHA256>`.
 본문은 `status`, `step`, `message`와 `run_id`(첫 콜백), `url`(성공), `reason`(실패). 형식은 백엔드 API 명세 9-3, 9-4절을 따릅니다.
 
+### 자원별 콜백 (트리용, 백엔드와 형식 협의 중)
+
+deploy 단계에서 `status=deploying`, `step=deploy`와 함께 `resources` 배열을 보냅니다.
+
+1. apply 전에 한 번: `terraform show -json`의 모든 자원 (`state`는 `pending`, 바뀌지 않는 자원은 `done`)
+2. apply 중에 자원마다: 시작하면 `in_progress`, 끝나면 `done`, 실패하면 `failed` + `reason`
+
+```json
+{"status": "deploying", "step": "deploy", "message": "aws_lb.app 완료",
+ "resources": [{"address": "aws_lb.app", "type": "aws_lb", "action": "create", "state": "done"}]}
+```
+
+`action`은 `create`, `update`, `replace`, `delete`, `no-op` 중 하나입니다. 화면은 `type`으로 서버·저장소·연결 같은 분류를 묶으면 됩니다.
+
 ## 시크릿
 
 | 이름 | 용도 | 상태 |

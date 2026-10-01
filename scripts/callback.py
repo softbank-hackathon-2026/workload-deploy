@@ -7,6 +7,8 @@ endpoint exists. A failed callback never fails the deployment: the backend falls
 Usage:
   callback.py <step> <message> [--run-id ID] [--url URL] [--reason TEXT]
   callback.py final                 # reads job results from env, sends success or failed
+  terraform show -json tfplan | callback.py plan-resources      # every resource in the plan, for the tree
+  terraform apply -json tfplan | callback.py apply-events       # per-resource start / done / failed
   callback.py --self-test
 """
 import argparse
@@ -62,7 +64,71 @@ def final_body(results, reasons_dir, app_url=None):
     return make_body("done", "배포가 완료되었습니다.", url=app_url)
 
 
-def send(body):
+# Per-resource progress for the tree view, read from Terraform's machine-readable output.
+STATE_LABELS = {"pending": "대기", "in_progress": "진행 중", "done": "완료", "failed": "실패"}
+
+
+def resource_body(resources, message):
+    return {"status": "deploying", "step": "deploy", "message": message, "resources": resources}
+
+
+def plan_resources(plan):
+    """`terraform show -json tfplan` -> every managed resource in the plan. Unchanged ones are already done."""
+    resources = []
+    for rc in plan.get("resource_changes", []):
+        if rc.get("mode") != "managed":
+            continue
+        actions = rc["change"]["actions"]
+        action = "replace" if len(actions) == 2 else actions[0]
+        resources.append({
+            "address": rc["address"],
+            "type": rc["type"],
+            "action": action,
+            "state": "done" if action == "no-op" else "pending",
+        })
+    return resources
+
+
+def apply_events(lines):
+    """`terraform apply -json` lines -> one resource update per start, completion or error.
+
+    Terraform prints the error diagnostic after apply_errored, so a failure waits for its diagnostic (or the end).
+    """
+    failed = {}
+    for line in lines:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        kind = msg.get("type")
+        if kind in ("apply_start", "apply_complete", "apply_errored"):
+            hook = msg["hook"]
+            r = {"address": hook["resource"]["addr"], "type": hook["resource"]["resource_type"], "action": hook["action"]}
+            if kind == "apply_errored":
+                failed[r["address"]] = r
+                continue
+            r["state"] = "in_progress" if kind == "apply_start" else "done"
+            yield r
+        elif kind == "diagnostic" and msg["diagnostic"].get("severity") == "error":
+            d = msg["diagnostic"]
+            r = failed.pop(d.get("address"), None)
+            if r:
+                yield {**r, "state": "failed", "reason": f"{d.get('summary', '')}: {d.get('detail', '')}".strip(": ")[:300]}
+    for r in failed.values():
+        yield {**r, "state": "failed", "reason": "자원을 만드는 중 오류가 났습니다."}
+
+
+def echo_messages(lines):
+    """Pass lines through while printing Terraform's human-readable message, so the Actions log stays readable."""
+    for line in lines:
+        try:
+            print(json.loads(line).get("@message", ""), flush=True)
+        except ValueError:
+            print(line.rstrip(), flush=True)
+        yield line
+
+
+def send(body, attempts=3, timeout=10):
     url = os.environ.get("CALLBACK_URL", "")
     secret = os.environ.get("DEPLOY_CALLBACK_SECRET", "")
     if not url or not secret:
@@ -76,9 +142,9 @@ def send(body):
 
     data = json.dumps(body, ensure_ascii=False).encode()
     headers = {"Content-Type": "application/json", "X-Hub-Signature-256": sign(secret, data)}
-    for attempt in range(1, 4):
+    for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, data, headers, method="POST"), timeout=10) as r:
+            with urllib.request.urlopen(urllib.request.Request(url, data, headers, method="POST"), timeout=timeout) as r:
                 print(f"callback {body['step']}/{body['status']}: HTTP {r.status}")
                 return
         except urllib.error.HTTPError as e:
@@ -93,7 +159,7 @@ def send(body):
             error = str(e) or type(e).__name__
         print(f"callback attempt {attempt} failed: {error}")
         time.sleep(2 * attempt)
-    print(f"::warning::callback {body['step']} gave up after 3 attempts")
+    print(f"::warning::callback {body['step']} gave up after {attempts} attempts")
 
 
 def self_test():
@@ -115,12 +181,59 @@ def self_test():
         assert (failed["step"], failed["status"], failed["reason"]) == ("build", "failed", "Dockerfile이 없습니다.")
         assert final_body({"prepare": "failure"}, d)["reason"] == DEFAULT_REASONS["prepare"]
         assert final_body({"prepare": "success", "build": "cancelled"}, d)["reason"] == "배포가 취소되었습니다."
+
+    plan = {"resource_changes": [
+        {"address": "aws_lb.app", "mode": "managed", "type": "aws_lb", "change": {"actions": ["create"]}},
+        {"address": "aws_ecs_cluster.app", "mode": "managed", "type": "aws_ecs_cluster", "change": {"actions": ["no-op"]}},
+        {"address": "aws_ecs_task_definition.app", "mode": "managed", "type": "aws_ecs_task_definition",
+         "change": {"actions": ["delete", "create"]}},
+        {"address": "data.aws_region.current", "mode": "data", "type": "aws_region", "change": {"actions": ["read"]}},
+    ]}
+    assert [(r["address"], r["action"], r["state"]) for r in plan_resources(plan)] == [
+        ("aws_lb.app", "create", "pending"),
+        ("aws_ecs_cluster.app", "no-op", "done"),
+        ("aws_ecs_task_definition.app", "replace", "pending"),
+    ]
+
+    def hook(kind, addr, rtype, action="create"):
+        return json.dumps({"type": kind, "hook": {"resource": {"addr": addr, "resource_type": rtype}, "action": action}})
+
+    lines = [
+        '{"type": "version", "terraform": "1.13.0"}',
+        hook("apply_start", "aws_lb.app", "aws_lb"),
+        hook("apply_progress", "aws_lb.app", "aws_lb"),
+        hook("apply_complete", "aws_lb.app", "aws_lb"),
+        hook("apply_start", "aws_ecs_service.app", "aws_ecs_service"),
+        hook("apply_errored", "aws_ecs_service.app", "aws_ecs_service"),
+        hook("apply_errored", "aws_iam_role.execution", "aws_iam_role"),
+        json.dumps({"type": "diagnostic", "diagnostic": {
+            "severity": "error", "summary": "creating ECS Service", "detail": "InvalidParameterException",
+            "address": "aws_ecs_service.app"}}),
+        "not json",
+    ]
+    events = [(e["address"], e["state"], e.get("reason")) for e in apply_events(lines)]
+    assert events == [
+        ("aws_lb.app", "in_progress", None),
+        ("aws_lb.app", "done", None),
+        ("aws_ecs_service.app", "in_progress", None),
+        ("aws_ecs_service.app", "failed", "creating ECS Service: InvalidParameterException"),
+        ("aws_iam_role.execution", "failed", "자원을 만드는 중 오류가 났습니다."),
+    ], events
+    assert resource_body([{"address": "a"}], "m")["status"] == "deploying"
     print("self-test ok")
 
 
 def main():
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
+    if sys.argv[1:] == ["plan-resources"]:
+        resources = plan_resources(json.load(sys.stdin))
+        return send(resource_body(resources, f"만들 자원 {len(resources)}개를 확인했습니다."))
+    if sys.argv[1:] == ["apply-events"]:
+        # Must read stdin to the end, or terraform blocks on a full pipe. Short retries so apply is not held up.
+        for r in apply_events(echo_messages(sys.stdin)):
+            send(resource_body([r], f"{r['address']} {STATE_LABELS[r['state']]}"), attempts=2, timeout=5)
+        return
     if sys.argv[1:] == ["final"]:
         results = {job: os.environ.get(f"{job.upper()}_RESULT", "skipped") for job in JOBS}
         return send(final_body(results, os.environ.get("REASONS_DIR", "reasons"), os.environ.get("APP_URL") or None))
