@@ -7,6 +7,8 @@ endpoint exists. A failed callback never fails the deployment: the backend falls
 Usage:
   callback.py <step> <message> [--run-id ID] [--url URL] [--reason TEXT]
   callback.py final                 # reads job results from env, sends success or failed
+  callback.py teardown              # destroy result to /app-spaces/{id}/teardown/callback (JOB_STATUS from env)
+  callback.py teardown              # destroy result to /app-spaces/{id}/teardown/callback (JOB_STATUS from env)
   terraform show -json tfplan | callback.py plan-resources      # every resource in the plan, for the tree
   terraform apply -json tfplan | callback.py apply-events       # per-resource start / done / failed
   callback.py --self-test
@@ -133,14 +135,29 @@ def echo_messages(lines):
         yield line
 
 
-def send(body, attempts=3, timeout=10):
+def teardown_body(reasons_dir, job_status):
+    """Destroy result for the teardown callback (API spec 9-5). job_status is ${{ job.status }}."""
+    if job_status == "success":
+        return {"status": "success"}
+    reason_file = Path(reasons_dir) / "destroy.txt"
+    if job_status == "cancelled":
+        reason = "내리기가 취소되었습니다."
+    elif reason_file.is_file():
+        reason = reason_file.read_text(encoding="utf-8").strip()
+    else:
+        reason = "내리기에 실패했습니다."
+    return {"status": "failed", "reason": reason}
+
+
+def send(body, attempts=3, timeout=10, expected=None):
     url = os.environ.get("CALLBACK_URL", "")
     secret = os.environ.get("DEPLOY_CALLBACK_SECRET", "")
+    label = f"{body.get('step', 'teardown')}/{body['status']}"
     if not url or not secret:
         print(f"callback skipped (no url or secret): {json.dumps(body, ensure_ascii=False)}")
         return
-    # Only ever call the platform's own callback path for this deployment.
-    expected = os.environ["CALLBACK_BASE"] + os.environ["DEPLOYMENT_ID"] + "/callback"
+    # Only ever call the platform's own callback path for this deployment (or this app's teardown).
+    expected = expected or os.environ["CALLBACK_BASE"] + os.environ["DEPLOYMENT_ID"] + "/callback"
     if url != expected:
         print(f"::warning::callback skipped: unexpected callback_url {url}")
         return
@@ -150,13 +167,13 @@ def send(body, attempts=3, timeout=10):
     for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(urllib.request.Request(url, data, headers, method="POST"), timeout=timeout) as r:
-                print(f"callback {body['step']}/{body['status']}: HTTP {r.status}")
+                print(f"callback {label}: HTTP {r.status}")
                 return
         except urllib.error.HTTPError as e:
             if e.code < 500:
                 # 409 = finished or stale deployment; the backend ignores it on purpose. Other 4xx will not fix themselves.
                 level = "" if e.code == 409 else "::warning::"
-                print(f"{level}callback {body['step']}/{body['status']}: HTTP {e.code}")
+                print(f"{level}callback {label}: HTTP {e.code}")
                 return
             error = f"HTTP {e.code}"
         except (OSError, http.client.HTTPException) as e:
@@ -164,7 +181,7 @@ def send(body, attempts=3, timeout=10):
             error = str(e) or type(e).__name__
         print(f"callback attempt {attempt} failed: {error}")
         time.sleep(2 * attempt)
-    print(f"::warning::callback {body['step']} gave up after {attempts} attempts")
+    print(f"::warning::callback {label} gave up after {attempts} attempts")
 
 
 def self_test():
@@ -231,6 +248,20 @@ def self_test():
         ("aws_iam_role.execution", "failed", "자원을 만드는 중 오류가 났습니다."),
     ], events
     assert resource_body([{"address": "a"}], "m")["status"] == "deploying"
+
+    with tempfile.TemporaryDirectory() as d:
+        assert teardown_body(d, "success") == {"status": "success"}
+        assert teardown_body(d, "failure") == {"status": "failed", "reason": "내리기에 실패했습니다."}
+        assert teardown_body(d, "cancelled")["reason"] == "내리기가 취소되었습니다."
+        Path(d, "destroy.txt").write_text("terraform destroy 실패\n", encoding="utf-8")
+        assert teardown_body(d, "failure") == {"status": "failed", "reason": "terraform destroy 실패"}
+
+    with tempfile.TemporaryDirectory() as d:
+        assert teardown_body(d, "success") == {"status": "success"}
+        assert teardown_body(d, "failure") == {"status": "failed", "reason": "내리기에 실패했습니다."}
+        assert teardown_body(d, "cancelled")["reason"] == "내리기가 취소되었습니다."
+        Path(d, "destroy.txt").write_text("terraform destroy 실패\n", encoding="utf-8")
+        assert teardown_body(d, "failure") == {"status": "failed", "reason": "terraform destroy 실패"}
     print("self-test ok")
 
 
@@ -245,6 +276,12 @@ def main():
         for r in apply_events(echo_messages(sys.stdin)):
             send(resource_body([r], f"{r['address']} {STATE_LABELS[r['state']]}"), attempts=2, timeout=5)
         return
+    if sys.argv[1:] == ["teardown"]:
+        expected = f"{os.environ['API_BASE']}/app-spaces/{os.environ['APPLICATION_ID']}/teardown/callback"
+        return send(teardown_body(os.environ.get("REASONS_DIR", "reasons"), os.environ["JOB_STATUS"]), expected=expected)
+    if sys.argv[1:] == ["teardown"]:
+        expected = f"{os.environ['API_BASE']}/app-spaces/{os.environ['APPLICATION_ID']}/teardown/callback"
+        return send(teardown_body(os.environ.get("REASONS_DIR", "reasons"), os.environ["JOB_STATUS"]), expected=expected)
     if sys.argv[1:] == ["final"]:
         results = {job: os.environ.get(f"{job.upper()}_RESULT", "skipped") for job in JOBS}
         return send(final_body(results, os.environ.get("REASONS_DIR", "reasons"), os.environ.get("APP_URL") or None))
