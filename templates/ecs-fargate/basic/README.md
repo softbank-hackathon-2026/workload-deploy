@@ -53,6 +53,7 @@ ALB와 Target Group은 이름이 32자로 제한돼서 짧은 형식을 씁니�
 | `app_url` | 앱 주소 (`http://<ALB 주소>`). 최종 콜백의 `url`로 보냄 |
 | `cluster_name` | ECS 클러스터 이름 |
 | `service_name` | ECS 서비스 이름 |
+| `health_check_path` | 배포 뒤 워크플로가 확인하는 경로 (Target Group 헬스체크와 같음) |
 | `task_definition_arn` | 이번 배포로 등록한 revision. 서비스가 이 revision으로 돌고 있는지(자동 롤백되지 않았는지) 확인할 때 씀 |
 
 ## 검사
