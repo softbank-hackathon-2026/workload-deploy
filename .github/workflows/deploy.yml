@@ -22,7 +22,7 @@ on:
         description: Infra Space ID
         required: true
       compute:
-        description: Compute type (only ecs-fargate for now)
+        description: Compute type (ecs-fargate or lambda)
         required: true
         default: ecs-fargate
       plan_id:
@@ -84,7 +84,7 @@ jobs:
           [[ -z "$PLAN_ID" || "$PLAN_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "plan_id must be lowercase letters, digits and hyphens"
           [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo must be owner/name"
           [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character SHA"
-          [[ "$COMPUTE" == "ecs-fargate" ]] || fail "compute $COMPUTE is not supported yet"
+          [[ "$COMPUTE" == "ecs-fargate" || "$COMPUTE" == "lambda" ]] || fail "compute $COMPUTE is not supported yet"
           if [[ -n "$CALLBACK_URL" && "$CALLBACK_URL" != "${CALLBACK_BASE}${DEPLOYMENT_ID}/callback" ]]; then
             fail "callback_url must be ${CALLBACK_BASE}<deployment_id>/callback"
           fi
@@ -114,6 +114,8 @@ jobs:
       - name: Build image
         env:
           COMMIT_SHA: ${{ inputs.commit_sha }}
+          COMPUTE: ${{ inputs.compute }}
+          LAMBDA_ADAPTER: public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0-x86_64@sha256:9d6b29a45b14a4a70f88d53c68b6d5bab1b22d75baca733958fee59308c509b8
         run: |
           mkdir -p "$RUNNER_TEMP/reasons"
           if [[ ! -f app/Dockerfile ]]; then
@@ -122,6 +124,12 @@ jobs:
             exit 1
           fi
           docker build -t "app:$COMMIT_SHA" app
+          # Lambda: add the Web Adapter so a plain HTTP server runs as a function (templates/lambda/basic).
+          # --provenance=false keeps a single-image manifest, which Lambda requires.
+          if [[ "$COMPUTE" == "lambda" ]]; then
+            printf 'FROM app:%s\nCOPY --from=%s /lambda-adapter /opt/extensions/lambda-adapter\n' "$COMMIT_SHA" "$LAMBDA_ADAPTER" \
+              | docker build --provenance=false -t "app:$COMMIT_SHA" -
+          fi
           docker save "app:$COMMIT_SHA" | gzip > "$RUNNER_TEMP/image.tar.gz"
 
       # The first EXPOSE port becomes container_port when the plan does not set one (plan.py). Only a number passes.
@@ -208,13 +216,15 @@ jobs:
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
           rm "$REASONS/deploy.txt"
 
-      # Tags are never overwritten. The same app and commit reuse the image already pushed.
+      # Tags are never overwritten. The same app, commit and compute reuse the image already pushed.
+      # Lambda images carry the adapter, so they get their own tag.
       - name: Push image
         id: image
         run: |
           echo "이미지를 Workload 이미지 저장소에 올리지 못했습니다." > "$REASONS/deploy.txt"
           REGISTRY="${WORKLOAD_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           TAG="${APPLICATION_ID}-${COMMIT_SHA}"
+          [[ "$COMPUTE" == "lambda" ]] && TAG="$TAG-lambda"
           if ! aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
             aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
             docker load -i "$RUNNER_TEMP/image.tar.gz"
@@ -275,10 +285,12 @@ jobs:
           terraform apply -input=false -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/callback.py" apply-events
           {
             echo "app_url=$(terraform output -raw app_url)"
-            echo "task_definition_arn=$(terraform output -raw task_definition_arn)"
-            echo "cluster=$(terraform output -raw cluster_name)"
-            echo "service=$(terraform output -raw service_name)"
             echo "health_check_path=$(terraform output -raw health_check_path)"
+            if [[ "$COMPUTE" == "ecs-fargate" ]]; then
+              echo "task_definition_arn=$(terraform output -raw task_definition_arn)"
+              echo "cluster=$(terraform output -raw cluster_name)"
+              echo "service=$(terraform output -raw service_name)"
+            fi
           } >> "$GITHUB_OUTPUT"
           rm "$REASONS/deploy.txt"
 
@@ -294,13 +306,16 @@ jobs:
           python3 scripts/callback.py verify "앱이 정상 응답하는지 확인하고 있습니다."
 
           # The circuit breaker may have rolled back to an older revision while the service still looks stable.
-          echo "서비스가 이번 버전으로 실행되지 않았습니다(자동 롤백)." > "$REASONS/deploy.txt"
-          RUNNING=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
-            --query "services[0].deployments[?status=='PRIMARY'] | [0].taskDefinition" --output text)
-          [[ "$RUNNING" == "$TASK_DEFINITION_ARN" ]] || { echo "::error::service runs $RUNNING"; exit 1; }
+          # Lambda has no rollback: apply already waited for the new image to be active.
+          if [[ "$COMPUTE" == "ecs-fargate" ]]; then
+            echo "서비스가 이번 버전으로 실행되지 않았습니다(자동 롤백)." > "$REASONS/deploy.txt"
+            RUNNING=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+              --query "services[0].deployments[?status=='PRIMARY'] | [0].taskDefinition" --output text)
+            [[ "$RUNNING" == "$TASK_DEFINITION_ARN" ]] || { echo "::error::service runs $RUNNING"; exit 1; }
+          fi
 
           # Same path and success codes as the target group health check, so apps without a / route still pass.
-          # A new ALB name can take a minute or two to resolve.
+          # A new ALB name can take a minute or two to resolve; a Lambda's first request includes its cold start.
           echo "앱이 제한 시간 안에 응답하지 않았습니다 (${HEALTH_CHECK_PATH})." > "$REASONS/deploy.txt"
           ok() { [[ "$CODE" =~ ^[23][0-9][0-9]$ ]]; }
           for i in $(seq 1 30); do

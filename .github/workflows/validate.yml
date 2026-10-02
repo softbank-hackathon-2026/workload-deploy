@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        template: [ecs-fargate/basic]
+        template: [ecs-fargate/basic, lambda/basic]
     defaults:
       run:
         working-directory: templates/${{ matrix.template }}
