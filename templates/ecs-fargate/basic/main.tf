@@ -95,7 +95,8 @@ resource "aws_lb_target_group" "app" {
   protocol             = "HTTP"
   target_type          = "ip"
   vpc_id               = var.vpc_id
-  deregistration_delay = 10
+  # Time for an old task to finish in-flight requests during a redeploy. Short, because deploy time matters for the demo.
+  deregistration_delay = 5
 
   # Short interval so a new task turns healthy (and the deploy finishes) sooner.
   health_check {
