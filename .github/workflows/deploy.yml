@@ -227,6 +227,12 @@ jobs:
         with:
           terraform_wrapper: false
 
+      # The AWS provider is ~100MB; reuse it across deploys instead of downloading it every time.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/terraform-plugin-cache
+          key: terraform-plugins-${{ hashFiles('templates/**/versions.tf') }}
+
       - name: Terraform plan
         working-directory: templates/${{ steps.vars.outputs.template }}
         env:
@@ -234,6 +240,8 @@ jobs:
           TEMPLATE: ${{ steps.vars.outputs.template }}
         run: |
           echo "배포 구성 값이 템플릿 검사를 통과하지 못했거나 plan에 실패했습니다." > "$REASONS/deploy.txt"
+          export TF_PLUGIN_CACHE_DIR="$RUNNER_TEMP/terraform-plugin-cache"
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
           terraform init -input=false -backend-config="bucket=$BUCKET" \
             -backend-config="key=apps/$APPLICATION_ID/terraform.tfstate" -backend-config="region=$AWS_REGION"
           terraform plan -input=false -out=tfplan -var-file="$RUNNER_TEMP/app.tfvars.json"

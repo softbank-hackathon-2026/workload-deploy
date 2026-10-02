@@ -97,11 +97,12 @@ resource "aws_lb_target_group" "app" {
   vpc_id               = var.vpc_id
   deregistration_delay = 10
 
+  # Short interval so a new task turns healthy (and the deploy finishes) sooner.
   health_check {
     path                = var.health_check_path
     matcher             = "200-399"
-    interval            = 10
-    timeout             = 5
+    interval            = 5
+    timeout             = 4
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
