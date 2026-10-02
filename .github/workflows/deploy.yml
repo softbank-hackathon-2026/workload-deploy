@@ -46,9 +46,10 @@ defaults:
   run:
     shell: bash
 
-# One deployment at a time across the whole service (ADR-011). Never cancel a deployment in progress.
+# One run at a time per app, so its Terraform state is never used twice at once. Different apps deploy in parallel
+# (two-app Multi-AZ demo). Never cancel a deployment in progress.
 concurrency:
-  group: workload-deploy
+  group: workload-deploy-${{ inputs.application_id }}
   cancel-in-progress: false
 
 env:

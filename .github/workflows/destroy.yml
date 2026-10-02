@@ -25,9 +25,9 @@ defaults:
   run:
     shell: bash
 
-# Same group as Deploy, so a destroy never runs in the middle of a deployment.
+# Same group as Deploy for this app, so a destroy never runs in the middle of its deployment.
 concurrency:
-  group: workload-deploy
+  group: workload-deploy-${{ inputs.application_id }}
   cancel-in-progress: false
 
 env:
