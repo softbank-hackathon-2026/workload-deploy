@@ -21,9 +21,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 from callback import sign  # noqa: E402
 
 DEFAULT_TEMPLATES = {"ecs-fargate": "ecs-fargate/basic", "lambda": "lambda/basic", "ec2": "ec2/basic"}
-# Computes that run inside the Space VPC, with the public subnets each needs (the ALB spans two AZs, EC2 uses one).
-# Lambda is public through its function URL and needs no network values.
-MIN_SUBNETS = {"ecs-fargate": 2, "ec2": 1}
+# Infra Space values each template takes: a number is the minimum list length, 0 means one non-empty value.
+# basic ALB spans two AZs, EC2 uses one subnet, Lambda needs no network, shared-alb joins the Space's own ALB.
+INFRA_NEEDS = {
+    "ecs-fargate/basic": {"vpc_id": 0, "public_subnet_ids": 2},
+    "ecs-fargate/shared-alb": {"vpc_id": 0, "private_subnet_ids": 2, "alb_listener_arn": 0,
+                               "alb_security_group_id": 0, "alb_base_url": 0},
+    "lambda/basic": {},
+    "ec2/basic": {"vpc_id": 0, "public_subnet_ids": 1},
+}
 RESERVED = {"application_id", "deployment_id", "infra_id", "image", "region"}
 TEMPLATE_PATTERN = re.compile(r"^[a-z0-9-]+/[a-z0-9-]+$")
 
@@ -38,7 +44,7 @@ def fetch_plan(api_base, plan_id, secret):
 
 
 def build(plan, compute, templates_dir, pipeline, exposed_port=None):
-    """plan: {"template", "values", "infra": {"vpc_id", "public_subnet_ids"}} -> {"template", "vars"}.
+    """plan: {"template", "values", "infra": {...}} -> {"template", "vars"}. INFRA_NEEDS lists the infra keys per template.
 
     pipeline: the workflow's own values (application_id, deployment_id, infra_id, image), applied last.
     exposed_port: the port from the app's Dockerfile EXPOSE, used only when the plan has no container_port.
@@ -50,13 +56,14 @@ def build(plan, compute, templates_dir, pipeline, exposed_port=None):
     if not (Path(templates_dir) / template).is_dir():
         raise ValueError(f"없는 템플릿입니다: {template}")
 
-    network = {}
-    if compute in MIN_SUBNETS:
-        infra = plan.get("infra") or {}
-        need = MIN_SUBNETS[compute]
-        if not infra.get("vpc_id") or len(infra.get("public_subnet_ids") or []) < need:
-            raise ValueError(f"인프라 값(VPC, 퍼블릭 서브넷 {need}개)이 없습니다.")
-        network = {"vpc_id": infra["vpc_id"], "public_subnet_ids": infra["public_subnet_ids"]}
+    if template not in INFRA_NEEDS:
+        raise ValueError(f"인프라 값 목록이 정해지지 않은 템플릿입니다: {template}")
+    infra = plan.get("infra") or {}
+    missing = [k for k, n in INFRA_NEEDS[template].items()
+               if not infra.get(k) or (n and len(infra[k]) < n)]
+    if missing:
+        raise ValueError(f"인프라 값이 없습니다: {', '.join(missing)}")
+    network = {k: infra[k] for k in INFRA_NEEDS[template]}
 
     values = {k: v for k, v in (plan.get("values") or {}).items() if k not in RESERVED}
     if "container_port" not in values and exposed_port:
@@ -99,6 +106,21 @@ def self_test():
         Path(d, "ec2", "basic").mkdir(parents=True)
         one = {"vpc_id": "vpc-1", "public_subnet_ids": ["subnet-a"]}
         assert build({"infra": one}, "ec2", d, pipeline)["vars"]["public_subnet_ids"] == ["subnet-a"]
+
+        # shared-alb takes the private subnets and the Space's ALB, not the public subnets.
+        Path(d, "ecs-fargate", "shared-alb").mkdir(parents=True)
+        multiaz = {**infra, "private_subnet_ids": ["subnet-pa", "subnet-pc"], "alb_listener_arn": "arn:listener",
+                   "alb_security_group_id": "sg-alb", "alb_base_url": "https://demo.howon.me"}
+        out = build({"template": "ecs-fargate/shared-alb", "values": {"path_pattern": "/api/*", "rule_priority": 10},
+                     "infra": multiaz}, "ecs-fargate", d, pipeline)["vars"]
+        assert "public_subnet_ids" not in out and out["private_subnet_ids"] == ["subnet-pa", "subnet-pc"], out
+        assert (out["alb_listener_arn"], out["path_pattern"], out["rule_priority"]) == ("arn:listener", "/api/*", 10), out
+        try:
+            build({"template": "ecs-fargate/shared-alb", "infra": infra}, "ecs-fargate", d, pipeline)
+        except ValueError as e:
+            assert "alb_listener_arn" in str(e), e
+        else:
+            raise AssertionError("shared-alb without ALB values must be rejected")
 
         for bad in ("../../etc", "lambda/basic", "ecs-fargate/missing", "ecs-fargate/basic/.."):
             try:
