@@ -20,9 +20,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from callback import sign  # noqa: E402
 
-DEFAULT_TEMPLATES = {"ecs-fargate": "ecs-fargate/basic", "lambda": "lambda/basic"}
-# Computes that run inside the Space VPC. Lambda is public through its function URL and needs no network values.
-NEEDS_VPC = {"ecs-fargate"}
+DEFAULT_TEMPLATES = {"ecs-fargate": "ecs-fargate/basic", "lambda": "lambda/basic", "ec2": "ec2/basic"}
+# Computes that run inside the Space VPC, with the public subnets each needs (the ALB spans two AZs, EC2 uses one).
+# Lambda is public through its function URL and needs no network values.
+MIN_SUBNETS = {"ecs-fargate": 2, "ec2": 1}
 RESERVED = {"application_id", "deployment_id", "infra_id", "image", "region"}
 TEMPLATE_PATTERN = re.compile(r"^[a-z0-9-]+/[a-z0-9-]+$")
 
@@ -50,10 +51,11 @@ def build(plan, compute, templates_dir, pipeline, exposed_port=None):
         raise ValueError(f"없는 템플릿입니다: {template}")
 
     network = {}
-    if compute in NEEDS_VPC:
+    if compute in MIN_SUBNETS:
         infra = plan.get("infra") or {}
-        if not infra.get("vpc_id") or len(infra.get("public_subnet_ids") or []) < 2:
-            raise ValueError("인프라 값(VPC, 퍼블릭 서브넷 2개)이 없습니다.")
+        need = MIN_SUBNETS[compute]
+        if not infra.get("vpc_id") or len(infra.get("public_subnet_ids") or []) < need:
+            raise ValueError(f"인프라 값(VPC, 퍼블릭 서브넷 {need}개)이 없습니다.")
         network = {"vpc_id": infra["vpc_id"], "public_subnet_ids": infra["public_subnet_ids"]}
 
     values = {k: v for k, v in (plan.get("values") or {}).items() if k not in RESERVED}
@@ -92,6 +94,11 @@ def self_test():
         out = build({"values": {"memory": 1024}, "infra": infra}, "lambda", d, pipeline, 3000)
         assert out == {"template": "lambda/basic",
                        "vars": {"memory": 1024, "container_port": 3000, "application_id": "app-1", "image": "repo@sha256:abc"}}, out
+
+        # EC2 needs the VPC and one public subnet; ecs-fargate needs two.
+        Path(d, "ec2", "basic").mkdir(parents=True)
+        one = {"vpc_id": "vpc-1", "public_subnet_ids": ["subnet-a"]}
+        assert build({"infra": one}, "ec2", d, pipeline)["vars"]["public_subnet_ids"] == ["subnet-a"]
 
         for bad in ("../../etc", "lambda/basic", "ecs-fargate/missing", "ecs-fargate/basic/.."):
             try:

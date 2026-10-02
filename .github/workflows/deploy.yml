@@ -22,7 +22,7 @@ on:
         description: Infra Space ID
         required: true
       compute:
-        description: Compute type (ecs-fargate or lambda)
+        description: Compute type (ecs-fargate, lambda or ec2)
         required: true
         default: ecs-fargate
       plan_id:
@@ -84,7 +84,7 @@ jobs:
           [[ -z "$PLAN_ID" || "$PLAN_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "plan_id must be lowercase letters, digits and hyphens"
           [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo must be owner/name"
           [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character SHA"
-          [[ "$COMPUTE" == "ecs-fargate" || "$COMPUTE" == "lambda" ]] || fail "compute $COMPUTE is not supported yet"
+          [[ "$COMPUTE" =~ ^(ecs-fargate|lambda|ec2)$ ]] || fail "compute $COMPUTE is not supported yet"
           if [[ -n "$CALLBACK_URL" && "$CALLBACK_URL" != "${CALLBACK_BASE}${DEPLOYMENT_ID}/callback" ]]; then
             fail "callback_url must be ${CALLBACK_BASE}<deployment_id>/callback"
           fi
