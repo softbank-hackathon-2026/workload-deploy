@@ -24,7 +24,7 @@ ALB와 Target Group은 이름이 32자로 제한돼서 짧은 형식을 씁니�
 
 | 속성 | 타입 | 기본값 | 허용 범위 | 역할 |
 |---|---|---|---|---|
-| `container_port` | number | `80` | 1~65535 정수 | 앱이 컨테이너 안에서 듣는 포트 |
+| `container_port` | number | `80` | 1~65535 정수 | 앱이 컨테이너 안에서 듣는 포트. 컨테이너에 `PORT` 환경변수로도 넣어서, `PORT`를 읽는 앱은 이 포트로 뜬다. 구성안에 없으면 Dockerfile의 첫 `EXPOSE` 포트를 쓴다 |
 | `cpu` | number | `256` | 256, 512, 1024 | Fargate CPU |
 | `memory` | number | `512` | cpu 256: 512·1024·2048 / 512: 1024~4096 / 1024: 2048~8192 (1024 단위) | Fargate 메모리(MiB) |
 | `health_check_path` | string | `/` | `/`로 시작, URL 경로 문자만 | ALB가 확인하는 경로. 2xx·3xx면 정상 |

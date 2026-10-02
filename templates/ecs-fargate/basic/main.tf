@@ -89,13 +89,14 @@ resource "aws_lb" "app" {
   tags               = { Name = "${local.short}-alb" }
 }
 
+# deregistration_delay: time for an old task to finish in-flight requests during a redeploy.
+# Short, because deploy time matters for the demo.
 resource "aws_lb_target_group" "app" {
   name                 = "${local.short}-tg"
   port                 = var.container_port
   protocol             = "HTTP"
   target_type          = "ip"
   vpc_id               = var.vpc_id
-  # Time for an old task to finish in-flight requests during a redeploy. Short, because deploy time matters for the demo.
   deregistration_delay = 5
 
   # Short interval so a new task turns healthy (and the deploy finishes) sooner.
