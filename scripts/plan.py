@@ -34,10 +34,11 @@ def fetch_plan(api_base, plan_id, secret):
         return json.load(r)
 
 
-def build(plan, compute, templates_dir, pipeline):
+def build(plan, compute, templates_dir, pipeline, exposed_port=None):
     """plan: {"template", "values", "infra": {"vpc_id", "public_subnet_ids"}} -> {"template", "vars"}.
 
     pipeline: the workflow's own values (application_id, deployment_id, infra_id, image), applied last.
+    exposed_port: the port from the app's Dockerfile EXPOSE, used only when the plan has no container_port.
     """
     template = plan.get("template") or DEFAULT_TEMPLATES[compute]
     # The template name becomes a path, so only a plain <compute>/<name> under templates/ is allowed.
@@ -51,6 +52,8 @@ def build(plan, compute, templates_dir, pipeline):
         raise ValueError("인프라 값(VPC, 퍼블릭 서브넷 2개)이 없습니다.")
 
     values = {k: v for k, v in (plan.get("values") or {}).items() if k not in RESERVED}
+    if "container_port" not in values and exposed_port:
+        values["container_port"] = exposed_port
     return {
         "template": template,
         "vars": {**values, "vpc_id": infra["vpc_id"], "public_subnet_ids": infra["public_subnet_ids"], **pipeline},
@@ -73,6 +76,11 @@ def self_test():
 
         # No plan (manual test): default template and only Space values.
         assert build({"infra": infra}, "ecs-fargate", d, pipeline)["template"] == "ecs-fargate/basic"
+
+        # Dockerfile EXPOSE fills container_port only when the plan does not set it.
+        assert build({"infra": infra}, "ecs-fargate", d, pipeline, 3000)["vars"]["container_port"] == 3000
+        assert build({"values": {"container_port": 8080}, "infra": infra}, "ecs-fargate", d, pipeline, 3000)["vars"]["container_port"] == 8080
+        assert "container_port" not in build({"infra": infra}, "ecs-fargate", d, pipeline)["vars"]
 
         for bad in ("../../etc", "lambda/basic", "ecs-fargate/missing", "ecs-fargate/basic/.."):
             try:
@@ -114,7 +122,9 @@ def main():
                 raise ValueError("test_plan이 올바른 JSON이 아닙니다.") from e
             if not isinstance(plan, dict):
                 raise ValueError("test_plan은 JSON 객체여야 합니다.")
-        out = build(plan, os.environ["COMPUTE"], os.environ.get("TEMPLATES_DIR", "templates"), pipeline)
+        exposed = os.environ.get("EXPOSED_PORT", "")
+        exposed_port = int(exposed) if exposed.isdigit() and 1 <= int(exposed) <= 65535 else None
+        out = build(plan, os.environ["COMPUTE"], os.environ.get("TEMPLATES_DIR", "templates"), pipeline, exposed_port)
     except ValueError as e:
         print(f"::error::{e}", file=sys.stderr)
         if os.environ.get("REASON_FILE"):

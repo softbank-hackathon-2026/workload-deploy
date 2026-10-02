@@ -101,6 +101,8 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      exposed_port: ${{ steps.port.outputs.exposed_port }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,6 +123,18 @@ jobs:
           fi
           docker build -t "app:$COMMIT_SHA" app
           docker save "app:$COMMIT_SHA" | gzip > "$RUNNER_TEMP/image.tar.gz"
+
+      # The first EXPOSE port becomes container_port when the plan does not set one (plan.py). Only a number passes.
+      - name: Detect exposed port
+        id: port
+        run: |
+          PORT=$(grep -iE '^[[:space:]]*EXPOSE[[:space:]]+' app/Dockerfile | head -1 | grep -oE '[0-9]+' | head -1 || true)
+          if [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )); then
+            echo "exposed_port=$PORT" >> "$GITHUB_OUTPUT"
+            echo "Dockerfile EXPOSE $PORT"
+          else
+            echo "No numeric EXPOSE in Dockerfile; the template default port is used unless the plan sets one."
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -216,6 +230,7 @@ jobs:
         id: vars
         env:
           IMAGE: ${{ steps.image.outputs.image }}
+          EXPOSED_PORT: ${{ needs.build.outputs.exposed_port }}
           PLAN_ID: ${{ inputs.plan_id }}
           TEST_PLAN: ${{ inputs.test_plan }}
           REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
