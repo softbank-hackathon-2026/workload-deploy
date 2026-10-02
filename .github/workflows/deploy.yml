@@ -278,6 +278,7 @@ jobs:
             echo "task_definition_arn=$(terraform output -raw task_definition_arn)"
             echo "cluster=$(terraform output -raw cluster_name)"
             echo "service=$(terraform output -raw service_name)"
+            echo "health_check_path=$(terraform output -raw health_check_path)"
           } >> "$GITHUB_OUTPUT"
           rm "$REASONS/deploy.txt"
 
@@ -287,6 +288,7 @@ jobs:
           TASK_DEFINITION_ARN: ${{ steps.apply.outputs.task_definition_arn }}
           CLUSTER: ${{ steps.apply.outputs.cluster }}
           SERVICE: ${{ steps.apply.outputs.service }}
+          HEALTH_CHECK_PATH: ${{ steps.apply.outputs.health_check_path }}
         run: |
           echo verify > "$REASONS/deploy.step"
           python3 scripts/callback.py verify "앱이 정상 응답하는지 확인하고 있습니다."
@@ -297,15 +299,17 @@ jobs:
             --query "services[0].deployments[?status=='PRIMARY'] | [0].taskDefinition" --output text)
           [[ "$RUNNING" == "$TASK_DEFINITION_ARN" ]] || { echo "::error::service runs $RUNNING"; exit 1; }
 
+          # Same path and success codes as the target group health check, so apps without a / route still pass.
           # A new ALB name can take a minute or two to resolve.
-          echo "앱 주소가 제한 시간 안에 응답하지 않았습니다." > "$REASONS/deploy.txt"
+          echo "앱이 제한 시간 안에 응답하지 않았습니다 (${HEALTH_CHECK_PATH})." > "$REASONS/deploy.txt"
+          ok() { [[ "$CODE" =~ ^[23][0-9][0-9]$ ]]; }
           for i in $(seq 1 30); do
-            CODE=$(curl -sL -o /dev/null -w '%{http_code}' --max-time 5 "$APP_URL/" || true)
-            echo "attempt $i: HTTP $CODE"
-            [[ "$CODE" == "200" ]] && break
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$APP_URL$HEALTH_CHECK_PATH" || true)
+            echo "attempt $i: $HEALTH_CHECK_PATH HTTP $CODE"
+            ok && break
             sleep 10
           done
-          [[ "$CODE" == "200" ]] || exit 1
+          ok || exit 1
           rm "$REASONS/deploy.txt" "$REASONS/deploy.step"
 
       - if: failure()

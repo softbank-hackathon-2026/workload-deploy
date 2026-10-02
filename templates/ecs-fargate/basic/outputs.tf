@@ -11,6 +11,11 @@ output "service_name" {
   value = aws_ecs_service.app.name
 }
 
+output "health_check_path" {
+  description = "Path the pipeline checks after apply, same as the target group health check."
+  value       = var.health_check_path
+}
+
 output "task_definition_arn" {
   description = "Revision this deploy registered. The pipeline checks the service is running it (not rolled back)."
   value       = aws_ecs_task_definition.app.arn
