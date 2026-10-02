@@ -141,6 +141,7 @@ resource "aws_ecs_task_definition" "app" {
     image        = var.image
     essential    = true
     portMappings = [{ containerPort = var.container_port, protocol = "tcp" }]
+    environment  = [{ name = "PORT", value = tostring(var.container_port) }]
     logConfiguration = {
       logDriver = "awslogs"
       options = {

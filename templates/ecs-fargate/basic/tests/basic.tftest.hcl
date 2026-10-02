@@ -60,9 +60,11 @@ run "filled_values" {
     condition = (
       aws_lb_target_group.app.port == 3000 && aws_lb_target_group.app.health_check[0].path == "/healthz" &&
       one([for r in aws_security_group.task.ingress : r.from_port]) == 3000 &&
-      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].portMappings[0].containerPort == 3000
+      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].portMappings[0].containerPort == 3000 &&
+      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment[0].name == "PORT" &&
+      jsondecode(aws_ecs_task_definition.app.container_definitions)[0].environment[0].value == "3000"
     )
-    error_message = "container_port and health_check_path must reach the target group, security group and task."
+    error_message = "container_port must reach the target group, security group, task port mapping and the PORT variable."
   }
 }
 
