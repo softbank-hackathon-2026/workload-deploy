@@ -1,5 +1,8 @@
 """Check the on-prem plan values (values.yaml) and write the Ansible Runner inputs for one VM deploy.
 
+Two computes: vm (the code is built and run on the VM itself, playbooks/deploy.yml) and vm-container
+(the repo's Dockerfile is built and run with Docker on the VM, playbooks/deploy-container.yml).
+
 The plan comes from the backend the same way as for AWS (plan.py load_plan: signed GET /api/plans/{plan_id},
 or TEST_PLAN for a manual run). Its values are checked here, since build_command and start_command run on the VM.
 
@@ -8,7 +11,7 @@ Usage:
   vm_plan.py remove <private_data_dir>   # destroy: same files for an app ID and a VM host from the inputs
   vm_plan.py --self-test
 
-Env: APPLICATION_ID, DEPLOYMENT_ID, APP_ARCHIVE (deploy), VM_HOST (remove), SSH_USER,
+Env: APPLICATION_ID, DEPLOYMENT_ID, APP_ARCHIVE (deploy), COMPUTE (deploy, default vm), VM_HOST (remove), SSH_USER,
      VM_LOCAL=true to run on the Actions runner itself (test only, no VM).
 """
 import json
@@ -34,6 +37,8 @@ DEFAULTS = {
     "war_file": "target/*.war",
     "env": {},
 }
+CONTAINER_DEFAULTS = {"container_port": 8080, "health_check_path": "/", "env": {}}
+PLAYBOOKS = {"vm": "deploy.yml", "vm-container": "deploy-container.yml"}
 PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,254}$")
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -47,16 +52,45 @@ def one_line(name, value):
     return value
 
 
-def check_values(raw):
-    """values.yaml -> Ansible variables. Refuses anything the playbook cannot run safely."""
-    v = {**DEFAULTS, **{k: x for k, x in (raw or {}).items() if k not in RESERVED}}
-    if v.get("runtime") not in RUNTIMES:
-        raise ValueError(f"runtime은 {', '.join(sorted(RUNTIMES))} 중 하나여야 합니다.")
-    port = v["app_port"]
-    if not (isinstance(port, int) and not isinstance(port, bool) and 1024 <= port <= 65535):
-        raise ValueError("app_port는 1024~65535 정수여야 합니다(앱은 일반 사용자로 실행됩니다).")
+def known(raw, names):
+    """Only the documented values reach Ansible: extra vars override playbook vars (app_dir, env_file, ...)."""
+    return {k: x for k, x in (raw or {}).items() if k in names and k not in RESERVED}
+
+
+def check_port(name, port, low):
+    if not (isinstance(port, int) and not isinstance(port, bool) and low <= port <= 65535):
+        raise ValueError(f"{name}는 {low}~65535 정수여야 합니다(VM에서 여는 포트는 1024 이상).")
+    return port
+
+
+def check_common(v):
+    """Checks shared by both computes; turns env into app_env."""
     if not (isinstance(v["health_check_path"], str) and PATH_RE.match(v["health_check_path"])):
         raise ValueError("health_check_path는 /로 시작하는 URL 경로여야 합니다.")
+    env = v.pop("env")
+    if not isinstance(env, dict) or not all(
+        ENV_NAME_RE.match(str(k)) and isinstance(x, str) and "\n" not in x and '"' not in x for k, x in env.items()
+    ):
+        raise ValueError("env는 대문자 이름과 한 줄 문자열 값이어야 합니다(따옴표 불가).")
+    v["app_env"] = env
+    return v
+
+
+def check_container_values(raw):
+    """vm-container: the repo's Dockerfile runs as a container, app_port on the VM -> container_port inside."""
+    v = {**CONTAINER_DEFAULTS, **known(raw, {*CONTAINER_DEFAULTS, "app_port"})}
+    check_port("container_port", v["container_port"], 1)
+    v.setdefault("app_port", v["container_port"] if v["container_port"] >= 1024 else 8080)
+    check_port("app_port", v["app_port"], 1024)
+    return check_common(v)
+
+
+def check_values(raw):
+    """values.yaml -> Ansible variables. Refuses anything the playbook cannot run safely."""
+    v = {**DEFAULTS, **known(raw, {*DEFAULTS, "runtime"})}
+    if v.get("runtime") not in RUNTIMES:
+        raise ValueError(f"runtime은 {', '.join(sorted(RUNTIMES))} 중 하나여야 합니다.")
+    check_port("app_port", v["app_port"], 1024)
     for name in ("build_command", "start_command", "war_file"):
         one_line(name, v[name])
     v["runtime_version"] = str(v["runtime_version"])
@@ -71,13 +105,7 @@ def check_values(raw):
             raise ValueError(f"tomcat_version은 {', '.join(sorted(TOMCAT_VERSIONS))}만 됩니다.")
     if not tomcat and not v["start_command"]:
         raise ValueError("start_command가 필요합니다(Tomcat에 올리는 WAR만 생략할 수 있습니다).")
-    env = v.pop("env")
-    if not isinstance(env, dict) or not all(
-        ENV_NAME_RE.match(str(k)) and isinstance(x, str) and "\n" not in x and '"' not in x for k, x in env.items()
-    ):
-        raise ValueError("env는 대문자 이름과 한 줄 문자열 값이어야 합니다(따옴표 불가).")
-    v["app_env"] = env
-    return v
+    return check_common(v)
 
 
 def inventory(host, user, local):
@@ -121,6 +149,18 @@ def self_test():
         except ValueError:
             continue
         raise AssertionError(f"{values} must be rejected")
+    c = check_container_values({"container_port": 3000, "env": {"APP_ENV": "demo"}, "image": "evil",
+                                "env_file": "/etc/environment", "runtime": "java"})
+    assert c == {"container_port": 3000, "app_port": 3000, "health_check_path": "/", "app_env": {"APP_ENV": "demo"}}, c
+    assert "app_dir" not in check_values({"runtime": "node", "start_command": "x", "app_dir": "/etc"})
+    assert check_container_values({"container_port": 80})["app_port"] == 8080
+    assert check_container_values({"container_port": 80, "app_port": 9000})["app_port"] == 9000
+    for values in ({"container_port": 0}, {"container_port": 3000, "app_port": 80}, {"env": {"a": "b"}}):
+        try:
+            check_container_values(values)
+        except ValueError:
+            continue
+        raise AssertionError(f"{values} must be rejected")
     assert inventory(None, None, True)["all"]["hosts"]["target"]["ansible_connection"] == "local"
     remote = inventory("app-vm.example.com", "deploy", False)["all"]["hosts"]["target"]
     assert (remote["ansible_host"], remote["ansible_user"]) == ("app-vm.example.com", "deploy")
@@ -142,15 +182,21 @@ def main():
     app_id = os.environ["APPLICATION_ID"]
     try:
         if mode == "prepare":
+            compute = os.environ.get("COMPUTE") or "vm"
+            if compute not in PLAYBOOKS:
+                raise ValueError(f"compute {compute}는 온프레미스에서 지원하지 않습니다(vm, vm-container).")
             plan = load_plan()
-            values = check_values(plan.get("values"))
+            check = check_container_values if compute == "vm-container" else check_values
+            values = check(plan.get("values"))
             host = "127.0.0.1" if local else (plan.get("infra") or {}).get("vm_host")
             inv = inventory(host, user, local)
             extravars = {**values, "application_id": app_id, "deployment_id": os.environ["DEPLOYMENT_ID"],
                          "app_archive": os.environ["APP_ARCHIVE"]}
-            port = 8080 if values["runtime"] == "java" and values["java_server"] == "tomcat" else values["app_port"]
+            tomcat = compute == "vm" and values["runtime"] == "java" and values["java_server"] == "tomcat"
+            port = 8080 if tomcat else values["app_port"]
             write(pdd, extravars, inv)
             print(f"app_url=http://{host}:{port}")
+            print(f"playbook={PLAYBOOKS[compute]}")
         elif mode == "remove":
             write(pdd, {"application_id": app_id}, inventory(os.environ.get("VM_HOST"), user, local))
         else:

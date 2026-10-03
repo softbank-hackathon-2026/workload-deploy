@@ -1,0 +1,87 @@
+# Runs one app as a Docker container on the on-prem service VM (compute vm-container, deploy-vm.yml).
+# The image is built on the VM from the repo's Dockerfile, so no registry or AWS key is needed on the VM.
+# Variables come from scripts/vm_plan.py: container_port, app_port, health_check_path, app_env.
+- name: Deploy app container
+  hosts: target
+  become: true
+  vars:
+    app_dir: "/opt/sbh-apps/{{ application_id }}"
+    env_file: "/opt/sbh-apps/{{ application_id }}.env"
+    container: "sbh-app-{{ application_id }}"
+    image: "sbh-app-{{ application_id }}:latest"
+
+  tasks:
+    # A VM that already has Docker (for example Docker CE) keeps it; installing docker.io over it would conflict.
+    - name: Check Docker
+      ansible.builtin.command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker
+      ansible.builtin.apt:
+        name: [docker.io, tar]
+        update_cache: true
+        cache_valid_time: 3600
+      when: docker_check.rc != 0
+
+    - name: Start Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Remove previous app files
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: absent
+
+    - name: Create app folder
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy app source
+      ansible.builtin.unarchive:
+        src: "{{ app_archive }}"
+        dest: "{{ app_dir }}"
+
+    - name: Build container image
+      ansible.builtin.command:
+        argv: [docker, build, --pull, -t, "{{ image }}", "{{ app_dir }}"]
+
+    # Values are one line without quotes (vm_plan.py), which is what docker --env-file reads.
+    - name: Write app environment
+      ansible.builtin.copy:
+        dest: "{{ env_file }}"
+        mode: "0600"
+        content: |
+          PORT={{ container_port }}
+          {% for name, value in app_env.items() %}
+          {{ name }}={{ value }}
+          {% endfor %}
+
+    - name: Remove previous container
+      ansible.builtin.command:
+        argv: [docker, rm, -f, "{{ container }}"]
+      failed_when: false
+
+    - name: Start app container
+      ansible.builtin.command:
+        argv: [docker, run, -d, --name, "{{ container }}", --restart, unless-stopped,
+               -p, "{{ app_port }}:{{ container_port }}", --env-file, "{{ env_file }}", "{{ image }}"]
+
+    # Images left untagged by the rebuild.
+    - name: Remove old images
+      ansible.builtin.command: docker image prune -f
+      changed_when: false
+
+    - name: Verify app answers
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ app_port }}{{ health_check_path }}"
+        status_code: "{{ range(200, 400) | list }}"
+      register: health
+      until: health.status is defined and 200 <= health.status < 400
+      retries: 30
+      delay: 2

@@ -25,6 +25,10 @@ on:
       infra_id:
         description: On-prem Infra Space ID
         required: true
+      compute:
+        description: vm (build and run the code on the VM) or vm-container (build and run the Dockerfile with Docker)
+        required: false
+        default: vm
       plan_id:
         description: Plan with values.yaml and the target VM. Empty uses test_plan.
         required: false
@@ -74,8 +78,10 @@ jobs:
           COMMIT_SHA: ${{ inputs.commit_sha }}
           INFRA_ID: ${{ inputs.infra_id }}
           PLAN_ID: ${{ inputs.plan_id }}
+          COMPUTE: ${{ inputs.compute }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
+          [[ "$COMPUTE" =~ ^(vm|vm-container)$ ]] || fail "compute must be vm or vm-container"
           [[ "$DEPLOYMENT_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "deployment_id must be lowercase letters, digits and hyphens"
           [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || fail "application_id must be 1-24 lowercase letters, digits and hyphens"
           [[ "$INFRA_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "infra_id must be lowercase letters, digits and hyphens"
@@ -160,6 +166,7 @@ jobs:
           PLAN_ID: ${{ inputs.plan_id }}
           TEST_PLAN: ${{ inputs.test_plan }}
           APP_ARCHIVE: ${{ runner.temp }}/app.tar.gz
+          COMPUTE: ${{ inputs.compute }}
           SSH_USER: ${{ secrets.ONPREM_SSH_USER }}
           REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
         run: |
@@ -197,9 +204,10 @@ jobs:
         env:
           TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          PLAYBOOK: ${{ steps.values.outputs.playbook }}
         run: |
           echo "VM에 앱을 설치하지 못했습니다(Ansible)." > "$REASONS/deploy.txt"
-          ansible-runner run "$PDD" -p deploy.yml --json | python3 scripts/callback.py ansible-events
+          ansible-runner run "$PDD" -p "$PLAYBOOK" --json | python3 scripts/callback.py ansible-events
           rm "$REASONS/deploy.txt"
 
       - if: failure()
