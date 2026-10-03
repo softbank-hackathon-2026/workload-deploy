@@ -37,6 +37,26 @@ resource "aws_iam_role_policy_attachment" "ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# App stdout/stderr from Docker's awslogs driver. The backend reads it for the app's log tab.
+resource "aws_cloudwatch_log_group" "app" {
+  name              = "/ec2/sbh-workload-demo-${var.application_id}"
+  retention_in_days = 7
+}
+
+# Write to this app's log group only. The Docker daemon uses the instance role.
+resource "aws_iam_role_policy" "logs" {
+  name = "write-app-logs"
+  role = aws_iam_role.instance.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+      Resource = "${aws_cloudwatch_log_group.app.arn}:*"
+    }]
+  })
+}
+
 resource "aws_iam_instance_profile" "instance" {
   name = "sbh-workload-demo-profile-ec2-${var.application_id}"
   role = aws_iam_role.instance.name
@@ -79,6 +99,7 @@ resource "aws_instance" "app" {
   }
 
   # Retries the pull because the instance role can take a few seconds to work after boot.
+  # Logs go to CloudWatch as <deployment_id>/<instance_id>/app, so the backend finds the current deployment's stream.
   user_data = <<-EOT
     #!/bin/bash
     set -eux
@@ -89,12 +110,18 @@ resource "aws_instance" "app" {
         && docker pull ${var.image} && break
       sleep 5
     done
-    docker run -d --name app --restart always -p 80:${var.container_port} -e PORT=${var.container_port} ${var.image}
+    TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+    INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+    docker run -d --name app --restart always -p 80:${var.container_port} -e PORT=${var.container_port} \
+      --log-driver awslogs --log-opt awslogs-region=${var.region} \
+      --log-opt awslogs-group=${aws_cloudwatch_log_group.app.name} \
+      --log-opt awslogs-stream=${var.deployment_id}/$INSTANCE_ID/app \
+      ${var.image}
   EOT
 
   user_data_replace_on_change = true
 
   tags = { Name = local.name, DeploymentId = var.deployment_id }
 
-  depends_on = [aws_iam_role_policy_attachment.ecr]
+  depends_on = [aws_iam_role_policy_attachment.ecr, aws_iam_role_policy.logs]
 }

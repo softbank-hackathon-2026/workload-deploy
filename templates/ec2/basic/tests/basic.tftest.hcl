@@ -35,6 +35,18 @@ run "defaults" {
     condition     = output.app_url == "http://ec2-3-34-0-1.ap-northeast-2.compute.amazonaws.com"
     error_message = "app_url must be the instance public DNS."
   }
+
+  assert {
+    condition = (
+      aws_cloudwatch_log_group.app.name == "/ec2/sbh-workload-demo-app-0123456789ab" &&
+      aws_cloudwatch_log_group.app.retention_in_days == 7 &&
+      strcontains(aws_instance.app.user_data, "--log-driver awslogs --log-opt awslogs-region=ap-northeast-2") &&
+      strcontains(aws_instance.app.user_data, "awslogs-group=/ec2/sbh-workload-demo-app-0123456789ab") &&
+      strcontains(aws_instance.app.user_data, "awslogs-stream=dep-0123456789ab/$INSTANCE_ID/app") &&
+      strcontains(aws_iam_role_policy.logs.policy, "logs:PutLogEvents")
+    )
+    error_message = "App logs must go to the 7-day log group as <deployment_id>/<instance_id>/app, with write access for the instance role."
+  }
 }
 
 run "filled_values" {

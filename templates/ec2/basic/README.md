@@ -22,8 +22,22 @@
 | 보안 그룹 (HTTP 80) | `sbh-workload-demo-sg-ec2-<application_id>` | 연결 |
 | 인스턴스 역할 (ECR 읽기, Session Manager) | `sbh-workload-demo-role-ec2-<application_id>` | 기타 |
 | 인스턴스 프로필 | `sbh-workload-demo-profile-ec2-<application_id>` | 기타 |
+| 로그 그룹 (7일) | `/ec2/sbh-workload-demo-<application_id>` | 기타 |
+| 로그 쓰기 권한 (인스턴스 역할의 인라인 정책) | `write-app-logs` | 기타 |
 
 SSH 키는 만들지 않습니다. 서버를 봐야 하면 AWS 콘솔의 Session Manager로 접속합니다.
+
+## 앱 로그
+
+앱의 stdout/stderr는 Docker `awslogs` 드라이버로 CloudWatch Logs에 보냅니다.
+
+| 항목 | 값 |
+|---|---|
+| 리전 | `ap-northeast-2` (`region` 변수) |
+| 로그 그룹 | `/ec2/sbh-workload-demo-<application_id>`, 보관 7일 |
+| 스트림 | `<deployment_id>/<instance_id>/app` |
+
+재배포하면 서버를 새로 만들어서 `deployment_id`와 `instance_id`가 함께 바뀝니다. 그래서 백엔드는 `<현재 deployment_id>/` 로 시작하는 스트림만 읽으면 현재 배포의 로그를 찾을 수 있습니다.
 
 ## 입력 속성
 
@@ -58,6 +72,8 @@ SSH 키는 만들지 않습니다. 서버를 봐야 하면 AWS 콘솔의 Session
 |---|---|
 | `app_url` | 앱 주소 (`http://<공인 DNS>`). 최종 콜백의 `url`로 보냄. 재배포하면 바뀜 |
 | `instance_id` | 인스턴스 ID |
+| `log_group_name` | 앱 로그 그룹 이름 |
+| `log_group_arn` | 앱 로그 그룹 ARN |
 | `health_check_path` | 배포 뒤 워크플로가 확인하는 경로 |
 
 ## 검사
