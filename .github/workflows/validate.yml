@@ -51,7 +51,7 @@ jobs:
       APPLICATION_ID: vm-check-${{ matrix.app.name }}
       DEPLOYMENT_ID: dep-vm-check
       VM_LOCAL: "true"
-      PDD: ${{ runner.temp }}/ansible-run
+      PDD: ${{ github.workspace }}/.ansible-run
     steps:
       - uses: actions/checkout@v4
 

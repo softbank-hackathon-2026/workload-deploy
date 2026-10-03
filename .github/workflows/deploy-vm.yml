@@ -138,7 +138,7 @@ jobs:
       APPLICATION_ID: ${{ inputs.application_id }}
       DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
       REASONS: ${{ github.workspace }}/reasons
-      PDD: ${{ runner.temp }}/ansible-run
+      PDD: ${{ github.workspace }}/.ansible-run
       VM_LOCAL: ${{ inputs.test_local }}
     steps:
       - uses: actions/checkout@v4

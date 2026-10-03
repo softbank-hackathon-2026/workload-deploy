@@ -50,7 +50,7 @@ jobs:
       VM_HOST: ${{ inputs.vm_host }}
       VM_LOCAL: ${{ inputs.test_local }}
       REASONS: ${{ github.workspace }}/reasons
-      PDD: ${{ runner.temp }}/ansible-run
+      PDD: ${{ github.workspace }}/.ansible-run
     steps:
       - uses: actions/checkout@v4
 
