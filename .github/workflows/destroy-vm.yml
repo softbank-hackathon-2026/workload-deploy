@@ -1,0 +1,111 @@
+# Removes one app from an on-prem service VM with Ansible (remove.yml). The AWS path is destroy.yml.
+# The backend's teardown passes the VM host it knows from the Infra Space; there is no Terraform state on-prem.
+name: Destroy VM
+run-name: destroy-vm ${{ inputs.application_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      application_id:
+        description: App Space ID to remove
+        required: true
+      confirm:
+        description: Type the application_id again to confirm
+        required: true
+      vm_host:
+        description: Service VM the app runs on (from the Infra Space). Ignored with test_local.
+        required: false
+        default: ""
+      test_local:
+        description: Test only. Remove from the Actions runner itself instead of the on-prem VM.
+        type: boolean
+        default: false
+      callback_url:
+        description: Backend teardown callback URL. Empty skips the callback.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: workload-deploy-${{ inputs.application_id }}
+  cancel-in-progress: false
+
+env:
+  API_BASE: https://sbh.howon.me/api
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      APPLICATION_ID: ${{ inputs.application_id }}
+      CONFIRM: ${{ inputs.confirm }}
+      CALLBACK_URL: ${{ inputs.callback_url }}
+      VM_HOST: ${{ inputs.vm_host }}
+      VM_LOCAL: ${{ inputs.test_local }}
+      REASONS: ${{ github.workspace }}/reasons
+      PDD: ${{ runner.temp }}/ansible-run
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          mkdir -p "$REASONS"
+          echo "내리기 요청 값이 올바르지 않습니다." > "$REASONS/destroy.txt"
+          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || { echo "::error::application_id must be 1-24 lowercase letters, digits and hyphens"; exit 1; }
+          [[ "$CONFIRM" == "$APPLICATION_ID" ]] || { echo "::error::confirm does not match application_id"; exit 1; }
+          if [[ -n "$CALLBACK_URL" && "$CALLBACK_URL" != "$API_BASE/app-spaces/$APPLICATION_ID/teardown/callback" ]]; then
+            echo "::error::callback_url must be $API_BASE/app-spaces/<application_id>/teardown/callback"; exit 1
+          fi
+          rm "$REASONS/destroy.txt"
+
+      - name: Prepare Ansible inputs
+        env:
+          SSH_USER: ${{ secrets.ONPREM_SSH_USER }}
+          REASON_FILE: ${{ github.workspace }}/reasons/destroy.txt
+        run: |
+          python3 scripts/vm_plan.py remove "$PDD"
+          cp -r ansible/playbooks "$PDD/project"
+
+      - name: Install Ansible Runner
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install -q "ansible-core>=2.16,<2.18" "ansible-runner>=2.4,<3"
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+
+      # Same assumed connection as deploy-vm.yml.
+      - name: Connect to the on-prem network (cloudflared)
+        if: inputs.test_local != true
+        env:
+          SSH_KEY: ${{ secrets.ONPREM_SSH_PRIVATE_KEY }}
+        run: |
+          echo "온프레미스 네트워크(cloudflared)에 연결하지 못했습니다." > "$REASONS/destroy.txt"
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared.deb" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "$RUNNER_TEMP/cloudflared.deb"
+          printf '%s\n' "$SSH_KEY" > "$PDD/env/ssh_key"
+          chmod 600 "$PDD/env/ssh_key"
+          rm "$REASONS/destroy.txt"
+
+      - name: Run remove playbook (Ansible Runner)
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          echo "VM에서 앱을 지우지 못했습니다(Ansible)." > "$REASONS/destroy.txt"
+          ansible-runner run "$PDD" -p remove.yml
+          rm "$REASONS/destroy.txt"
+
+      - name: Report result
+        if: always()
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+          JOB_STATUS: ${{ job.status }}
+          REASONS_DIR: ${{ github.workspace }}/reasons
+        run: python3 scripts/callback.py teardown

@@ -1,0 +1,16 @@
+[Unit]
+Description=Freesia app {{ application_id }} (deployment {{ deployment_id }})
+After=network.target
+
+[Service]
+User={{ app_user }}
+WorkingDirectory={{ app_dir }}
+Environment="PORT={{ app_port }}"
+{% for name, value in app_env.items() %}
+Environment="{{ name }}={{ value }}"
+{% endfor %}
+ExecStart=/bin/sh -c {{ start_command | quote }}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
