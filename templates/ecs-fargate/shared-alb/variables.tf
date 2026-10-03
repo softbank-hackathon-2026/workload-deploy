@@ -141,6 +141,19 @@ variable "memory" {
   }
 }
 
+# Set by the template for the Space, not by AI: the Multi-AZ Space is for high availability, so two tasks by default.
+
+variable "desired_count" {
+  description = "Tasks to run. ECS spreads them across the private subnets, so 2 puts one in each AZ."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.desired_count >= 1 && var.desired_count <= 4 && floor(var.desired_count) == var.desired_count
+    error_message = "desired_count must be an integer between 1 and 4."
+  }
+}
+
 variable "health_check_path" {
   description = "HTTP path the target group checks and the pipeline calls through the shared address. Must fall under path_pattern (e.g. /api/health for /api/*). Any 2xx or 3xx response is healthy."
   type        = string

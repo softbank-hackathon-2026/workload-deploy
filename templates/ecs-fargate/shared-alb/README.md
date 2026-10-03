@@ -24,7 +24,7 @@ Multi-AZ Space의 **공용 ALB**(`demo.howon.me`) 뒤에 앱 하나를 Fargate�
 | 자원 | 이름 | 트리 분류(예시) |
 |---|---|---|
 | ECS 클러스터 | `sbh-workload-demo-ecs-<application_id>` | 서버 |
-| ECS 서비스 (Task 1개, 공인 IP 없음) | `sbh-workload-demo-svc-<application_id>` | 서버 |
+| ECS 서비스 (Task 2개, 가용 영역마다 1개, 공인 IP 없음) | `sbh-workload-demo-svc-<application_id>` | 서버 |
 | Task Definition | `sbh-workload-demo-task-<application_id>` | 서버 |
 | 실행 역할, 정책 연결 | `sbh-workload-demo-role-exec-<application_id>` | 기타 |
 | 로그 그룹 (7일) | `/ecs/sbh-workload-demo-<application_id>` | 기타 |
@@ -48,6 +48,12 @@ Multi-AZ Space의 **공용 ALB**(`demo.howon.me`) 뒤에 앱 하나를 Fargate�
 |---|---|---|---|
 | `path_pattern` | string | `/*` | 공용 주소에서 이 앱이 맡는 경로. `/`로 시작하고 `*`로 끝날 수 있음. 예: `/api/*`, `/*` |
 | `rule_priority` | number | 필수 | 리스너 규칙 번호(1~50000). ALB는 **작은 번호부터** 확인하므로 좁은 경로(`/api/*`)가 넓은 경로(`/*`)보다 작아야 함. 같은 리스너에서 앱끼리 겹치면 안 됨 |
+
+### 템플릿이 정하는 값 (Space 성격, AI가 아님)
+
+| 속성 | 타입 | 기본값 | 역할 |
+|---|---|---|---|
+| `desired_count` | number | `2` | Task 수(1~4). Multi-AZ Space는 고가용성용이라 기본 2개로 app 서브넷 2a·2c에 하나씩 띄웁니다. 한쪽 가용 영역에 장애가 나도 다른 쪽이 계속 응답합니다 |
 
 ### 인프라 Space가 주는 값 (구성안 `infra`)
 

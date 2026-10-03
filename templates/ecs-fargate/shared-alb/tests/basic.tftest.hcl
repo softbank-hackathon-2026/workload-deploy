@@ -28,6 +28,7 @@ run "web_defaults" {
 
   assert {
     condition = (
+      aws_ecs_service.app.desired_count == 2 &&
       !aws_ecs_service.app.network_configuration[0].assign_public_ip &&
       aws_ecs_service.app.network_configuration[0].subnets == toset(var.private_subnet_ids) &&
       aws_lb_listener_rule.app.priority == 100 &&
