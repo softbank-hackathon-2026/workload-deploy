@@ -1,0 +1,114 @@
+# Installs one app on the on-prem service VM (deploy-vm.yml runs this through Ansible Runner).
+# Variables come from scripts/vm_plan.py: the plan's values.yaml plus the pipeline's own values.
+# Ansible keeps the VM in this state on every run: same runtime packages, same files, same service.
+- name: Deploy app
+  hosts: target
+  become: true
+  vars:
+    app_user: sbh-app
+    app_dir: "/opt/sbh-apps/{{ application_id }}"
+    service_name: "sbh-app-{{ application_id }}"
+    use_tomcat: "{{ runtime == 'java' and java_server == 'tomcat' }}"
+    tomcat_webapps: "/var/lib/tomcat{{ tomcat_version }}/webapps"
+    check_port: "{{ 8080 if use_tomcat | bool else app_port }}"
+
+  tasks:
+    # acl lets Ansible run the build as the unprivileged app user.
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [acl, tar]
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Python runtime
+      ansible.builtin.apt:
+        name: [python3, python3-venv, python3-pip]
+      when: runtime == 'python'
+
+    - name: Install Node.js runtime
+      ansible.builtin.apt:
+        name: [nodejs, npm]
+      when: runtime == 'node'
+
+    # The JDK, not only the JRE, so build_command can compile on the VM.
+    - name: Install Java runtime
+      ansible.builtin.apt:
+        name: "openjdk-{{ runtime_version }}-jdk-headless"
+      when: runtime == 'java'
+
+    - name: Install Tomcat
+      ansible.builtin.apt:
+        name: "tomcat{{ tomcat_version }}"
+      when: use_tomcat | bool
+
+    - name: Create app user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    # A redeploy starts from a clean folder so files removed from the repo do not linger.
+    - name: Remove previous app files
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: absent
+
+    - name: Create app folder
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Copy app source
+      ansible.builtin.unarchive:
+        src: "{{ app_archive }}"
+        dest: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+
+    - name: Build app
+      ansible.builtin.shell: "{{ build_command }}"
+      args:
+        chdir: "{{ app_dir }}"
+      become_user: "{{ app_user }}"
+      environment:
+        HOME: "{{ app_dir }}"
+      when: build_command | length > 0
+
+    - name: Write app service
+      ansible.builtin.template:
+        src: app.service.j2
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: "0644"
+      when: not (use_tomcat | bool)
+
+    - name: Start app service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: not (use_tomcat | bool)
+
+    # ponytail: one Tomcat app per VM (it takes the ROOT path). Use context paths if a VM must host several WARs.
+    - name: Deploy WAR to Tomcat
+      ansible.builtin.shell: |
+        set -e
+        war=$(ls {{ app_dir }}/{{ war_file }} | head -1)
+        rm -rf {{ tomcat_webapps }}/ROOT {{ tomcat_webapps }}/ROOT.war
+        install -m 0644 "$war" {{ tomcat_webapps }}/ROOT.war
+        mkdir -p /var/lib/sbh-apps
+        echo {{ tomcat_version }} > /var/lib/sbh-apps/{{ application_id }}.tomcat
+      when: use_tomcat | bool
+
+    - name: Verify app answers
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ check_port }}{{ health_check_path }}"
+        status_code: "{{ range(200, 400) | list }}"
+      register: health
+      until: health.status is defined and 200 <= health.status < 400
+      retries: 30
+      delay: 2

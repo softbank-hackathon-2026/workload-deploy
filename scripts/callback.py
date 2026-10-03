@@ -8,7 +8,7 @@ Usage:
   callback.py <step> <message> [--run-id ID] [--url URL] [--reason TEXT]
   callback.py final                 # reads job results from env, sends success or failed
   callback.py teardown              # destroy result to /app-spaces/{id}/teardown/callback (JOB_STATUS from env)
-  callback.py teardown              # destroy result to /app-spaces/{id}/teardown/callback (JOB_STATUS from env)
+  ansible-runner run ... --json | callback.py ansible-events     # on-prem: per-task start / done / failed
   terraform show -json tfplan | callback.py plan-resources      # every resource in the plan, for the tree
   terraform apply -json tfplan | callback.py apply-events       # per-resource start / done / failed
   callback.py --self-test
@@ -123,6 +123,42 @@ def apply_events(lines):
                 yield {**r, "state": "failed", "reason": f"{d.get('summary', '')}: {d.get('detail', '')}".strip(": ")[:300]}
     for r in failed.values():
         yield {**r, "state": "failed", "reason": "자원을 만드는 중 오류가 났습니다."}
+
+
+def ansible_events(lines):
+    """`ansible-runner run --json` lines -> one tree update per task start, success or failure (on-prem deploy).
+
+    Each Ansible task shows up as a resource of type ansible_task, so the screen draws it like a Terraform resource.
+    Failures that the playbook ignores on purpose (ignore_errors) are not reported as failed.
+    """
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        data = event.get("event_data") or {}
+        task = data.get("task")
+        if not task:
+            continue
+        r = {"address": task, "type": "ansible_task", "action": "create"}
+        kind = event.get("event")
+        if kind == "playbook_on_task_start":
+            yield {**r, "state": "in_progress"}
+        elif kind in ("runner_on_ok", "runner_on_skipped"):
+            yield {**r, "state": "done"}
+        elif kind in ("runner_on_failed", "runner_on_unreachable") and not data.get("ignore_errors"):
+            msg = (data.get("res") or {}).get("msg") or "작업이 실패했습니다."
+            yield {**r, "state": "failed", "reason": str(msg)[:300]}
+
+
+def echo_ansible(lines):
+    """Pass Ansible Runner JSON events through while printing Ansible's own output to the Actions log."""
+    for line in lines:
+        try:
+            print(json.loads(line).get("stdout", ""), flush=True)
+        except ValueError:
+            print(line.rstrip(), flush=True)
+        yield line
 
 
 def echo_messages(lines):
@@ -249,6 +285,28 @@ def self_test():
     ], events
     assert resource_body([{"address": "a"}], "m")["status"] == "deploying"
 
+    def ev(kind, task, **data):
+        return json.dumps({"event": kind, "stdout": "", "event_data": {"task": task, **data}})
+
+    lines = [
+        ev("playbook_on_start", None),
+        ev("playbook_on_task_start", "Install Python runtime"),
+        ev("runner_on_ok", "Install Python runtime"),
+        ev("playbook_on_task_start", "Stop app service"),
+        ev("runner_on_failed", "Stop app service", ignore_errors=True, res={"msg": "not found"}),
+        ev("playbook_on_task_start", "Verify app answers"),
+        ev("runner_on_failed", "Verify app answers", res={"msg": "Status code was -1"}),
+        "not json",
+    ]
+    events = [(e["address"], e["type"], e["state"], e.get("reason")) for e in ansible_events(lines)]
+    assert events == [
+        ("Install Python runtime", "ansible_task", "in_progress", None),
+        ("Install Python runtime", "ansible_task", "done", None),
+        ("Stop app service", "ansible_task", "in_progress", None),
+        ("Verify app answers", "ansible_task", "in_progress", None),
+        ("Verify app answers", "ansible_task", "failed", "Status code was -1"),
+    ], events
+
     with tempfile.TemporaryDirectory() as d:
         assert teardown_body(d, "success") == {"status": "success"}
         assert teardown_body(d, "failure") == {"status": "failed", "reason": "내리기에 실패했습니다."}
@@ -276,9 +334,11 @@ def main():
         for r in apply_events(echo_messages(sys.stdin)):
             send(resource_body([r], f"{r['address']} {STATE_LABELS[r['state']]}"), attempts=2, timeout=5)
         return
-    if sys.argv[1:] == ["teardown"]:
-        expected = f"{os.environ['API_BASE']}/app-spaces/{os.environ['APPLICATION_ID']}/teardown/callback"
-        return send(teardown_body(os.environ.get("REASONS_DIR", "reasons"), os.environ["JOB_STATUS"]), expected=expected)
+    if sys.argv[1:] == ["ansible-events"]:
+        # Reads stdin to the end so ansible-runner never blocks on a full pipe. Short retries, like apply-events.
+        for r in ansible_events(echo_ansible(sys.stdin)):
+            send(resource_body([r], f"{r['address']} {STATE_LABELS[r['state']]}"), attempts=2, timeout=5)
+        return
     if sys.argv[1:] == ["teardown"]:
         expected = f"{os.environ['API_BASE']}/app-spaces/{os.environ['APPLICATION_ID']}/teardown/callback"
         return send(teardown_body(os.environ.get("REASONS_DIR", "reasons"), os.environ["JOB_STATUS"]), expected=expected)

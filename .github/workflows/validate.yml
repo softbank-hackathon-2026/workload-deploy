@@ -1,12 +1,13 @@
-# Checks the Terraform templates: format, validate and mock-provider tests. No AWS access.
+# Checks the Terraform templates (format, validate, mock-provider tests) and the on-prem Ansible playbooks
+# (deployed to the Actions runner itself, which stands in for the VM). No AWS or VM access.
 name: Validate
 
 on:
   push:
     branches: [main]
-    paths: ["templates/**", ".github/workflows/validate.yml"]
+    paths: ["templates/**", "ansible/**", "scripts/**", "tests/**", ".github/workflows/validate.yml"]
   pull_request:
-    paths: ["templates/**", ".github/workflows/validate.yml"]
+    paths: ["templates/**", "ansible/**", "scripts/**", "tests/**", ".github/workflows/validate.yml"]
 
 permissions:
   contents: read
@@ -32,3 +33,59 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
       - run: terraform test
+
+  # Runs deploy.yml and remove.yml through Ansible Runner against the runner itself, with the same inputs
+  # deploy-vm.yml builds (vm_plan.py), and checks the app answers, then that it is gone.
+  vm-playbook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        app:
+          - { name: python, start: "python3 app.py" }
+          - { name: node, start: "node server.js" }
+    defaults:
+      run:
+        shell: bash
+    env:
+      APPLICATION_ID: vm-check-${{ matrix.app.name }}
+      DEPLOYMENT_ID: dep-vm-check
+      VM_LOCAL: "true"
+      PDD: ${{ github.workspace }}/.ansible-run
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Script self-tests
+        run: |
+          python3 scripts/plan.py --self-test
+          python3 scripts/vm_plan.py --self-test
+          python3 scripts/callback.py --self-test
+
+      - name: Install Ansible Runner
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install -q "ansible-core>=2.16,<2.18" "ansible-runner>=2.4,<3"
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Deploy test app
+        env:
+          APP_ARCHIVE: ${{ runner.temp }}/app.tar.gz
+          TEST_PLAN: >-
+            {"values": {"runtime": "${{ matrix.app.name }}", "app_port": 8080, "health_check_path": "/health",
+            "start_command": "${{ matrix.app.start }}", "env": {"APP_ENV": "check"}}}
+        run: |
+          tar -czf "$APP_ARCHIVE" -C "tests/vm-apps/${{ matrix.app.name }}" .
+          python3 scripts/vm_plan.py prepare "$PDD"
+          cp -r ansible/playbooks "$PDD/project"
+          ansible-runner run "$PDD" -p deploy.yml --json | python3 scripts/callback.py ansible-events
+          curl -fsS http://127.0.0.1:8080/health
+          systemctl show "sbh-app-$APPLICATION_ID" -p Environment | grep -q "APP_ENV=check"
+
+      - name: Remove test app
+        run: |
+          rm -rf "$PDD"
+          python3 scripts/vm_plan.py remove "$PDD"
+          cp -r ansible/playbooks "$PDD/project"
+          ansible-runner run "$PDD" -p remove.yml
+          ! systemctl is-active --quiet "sbh-app-$APPLICATION_ID"
+          [[ ! -d "/opt/sbh-apps/$APPLICATION_ID" ]]

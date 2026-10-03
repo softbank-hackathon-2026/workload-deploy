@@ -1,0 +1,43 @@
+# Removes one app from the on-prem service VM (destroy-vm.yml). Runtime packages and Tomcat stay for other apps.
+- name: Remove app
+  hosts: target
+  become: true
+  vars:
+    app_dir: "/opt/sbh-apps/{{ application_id }}"
+    service_name: "sbh-app-{{ application_id }}"
+    tomcat_marker: "/var/lib/sbh-apps/{{ application_id }}.tomcat"
+
+  tasks:
+    - name: Stop app service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Remove app service
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ service_name }}.service"
+        state: absent
+
+    - name: Reload services
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Find Tomcat deployment
+      ansible.builtin.slurp:
+        src: "{{ tomcat_marker }}"
+      register: tomcat
+      failed_when: false
+
+    - name: Remove WAR from Tomcat
+      ansible.builtin.file:
+        path: "/var/lib/tomcat{{ tomcat.content | b64decode | trim }}/webapps/ROOT.war"
+        state: absent
+      when: tomcat.content is defined
+
+    - name: Remove app files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: ["{{ app_dir }}", "{{ tomcat_marker }}"]

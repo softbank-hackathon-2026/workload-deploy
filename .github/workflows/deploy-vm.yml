@@ -1,0 +1,236 @@
+# User app deployment to an on-prem service VM (Proxmox) with Ansible. The AWS path is deploy.yml (Terraform).
+# The backend's VM deploy API starts this with workflow_dispatch. Inputs, checks and callbacks match deploy.yml.
+#
+# Flow: prepare -> build (package the user's code, no secrets) -> deploy (values.yaml from the plan + playbook,
+# cloudflared to the VM, Ansible Runner) -> report. Ansible Runner events become the same resource callbacks
+# the screen already draws.
+name: Deploy VM
+run-name: deploy-vm ${{ inputs.deployment_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: Deployment ID issued by the backend (lowercase, digits, hyphens)
+        required: true
+      application_id:
+        description: App Space ID
+        required: true
+      repo:
+        description: Public GitHub repo of the user app (owner/name)
+        required: true
+      commit_sha:
+        description: Full commit SHA to deploy
+        required: true
+      infra_id:
+        description: On-prem Infra Space ID
+        required: true
+      plan_id:
+        description: Plan with values.yaml and the target VM. Empty uses test_plan.
+        required: false
+        default: ""
+      test_plan:
+        description: 'Test only, when plan_id is empty: {"values": {...}, "infra": {"vm_host": "..."}}'
+        required: false
+        default: ""
+      test_local:
+        description: Test only. Run the playbook on the Actions runner itself instead of the on-prem VM.
+        type: boolean
+        default: false
+      callback_url:
+        description: Backend callback URL. Empty skips callbacks.
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Same per-app group as deploy.yml, so one app never runs two deployments at once.
+concurrency:
+  group: workload-deploy-${{ inputs.application_id }}
+  cancel-in-progress: false
+
+env:
+  API_BASE: https://sbh.howon.me/api
+  CALLBACK_BASE: https://sbh.howon.me/api/deployments/
+  DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+  CALLBACK_URL: ${{ inputs.callback_url }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        env:
+          APPLICATION_ID: ${{ inputs.application_id }}
+          REPO: ${{ inputs.repo }}
+          COMMIT_SHA: ${{ inputs.commit_sha }}
+          INFRA_ID: ${{ inputs.infra_id }}
+          PLAN_ID: ${{ inputs.plan_id }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$DEPLOYMENT_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "deployment_id must be lowercase letters, digits and hyphens"
+          [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || fail "application_id must be 1-24 lowercase letters, digits and hyphens"
+          [[ "$INFRA_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "infra_id must be lowercase letters, digits and hyphens"
+          [[ -z "$PLAN_ID" || "$PLAN_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "plan_id must be lowercase letters, digits and hyphens"
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "repo must be owner/name"
+          [[ "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "commit_sha must be a full 40-character SHA"
+          if [[ -n "$CALLBACK_URL" && "$CALLBACK_URL" != "${CALLBACK_BASE}${DEPLOYMENT_ID}/callback" ]]; then
+            fail "callback_url must be ${CALLBACK_BASE}<deployment_id>/callback"
+          fi
+
+      - name: Report prepare and build start
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+        run: |
+          python3 scripts/callback.py prepare "배포를 준비하고 있습니다." --run-id "$GITHUB_RUN_ID"
+          python3 scripts/callback.py build "앱 코드를 준비하고 있습니다."
+
+  # Only packages the user's code; the build itself runs on the VM (build_command), where the runtime lives.
+  # No secrets here, same as deploy.yml.
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.commit_sha }}
+          path: app
+          persist-credentials: false
+
+      - name: Package app code
+        run: |
+          mkdir -p "$RUNNER_TEMP/reasons"
+          echo "앱 코드를 묶지 못했습니다." > "$RUNNER_TEMP/reasons/build.txt"
+          tar -czf "$RUNNER_TEMP/app.tar.gz" -C app --exclude=.git .
+          rm "$RUNNER_TEMP/reasons/build.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-code
+          path: ${{ runner.temp }}/app.tar.gz
+          retention-days: 1
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-build
+          path: ${{ runner.temp }}/reasons/
+          if-no-files-found: ignore
+
+  # Named deploy (not deploy-vm) so callback.py final reads its result like the AWS path.
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      app_url: ${{ steps.values.outputs.app_url }}
+    env:
+      APPLICATION_ID: ${{ inputs.application_id }}
+      DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+      REASONS: ${{ github.workspace }}/reasons
+      PDD: ${{ github.workspace }}/.ansible-run
+      VM_LOCAL: ${{ inputs.test_local }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report deploy start
+        run: |
+          mkdir -p "$REASONS"
+          python3 scripts/callback.py deploy "온프레미스 VM에 배포하고 있습니다."
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-code
+          path: ${{ runner.temp }}
+
+      # values.yaml comes in the plan (same signed fetch as the AWS path) and is checked before anything reaches the VM.
+      - name: Prepare values
+        id: values
+        env:
+          PLAN_ID: ${{ inputs.plan_id }}
+          TEST_PLAN: ${{ inputs.test_plan }}
+          APP_ARCHIVE: ${{ runner.temp }}/app.tar.gz
+          SSH_USER: ${{ secrets.ONPREM_SSH_USER }}
+          REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
+        run: |
+          python3 scripts/vm_plan.py prepare "$PDD" >> "$GITHUB_OUTPUT"
+          cp -r ansible/playbooks "$PDD/project"
+
+      - name: Install Ansible Runner
+        run: |
+          echo "Ansible을 준비하지 못했습니다." > "$REASONS/deploy.txt"
+          python3 -m venv "$RUNNER_TEMP/ansible-venv"
+          "$RUNNER_TEMP/ansible-venv/bin/pip" install -q "ansible-core>=2.16,<2.18" "ansible-runner>=2.4,<3"
+          echo "$RUNNER_TEMP/ansible-venv/bin" >> "$GITHUB_PATH"
+          rm "$REASONS/deploy.txt"
+
+      # Assumed connection until the on-prem owner confirms it: Cloudflare Access in front of the VM's SSH,
+      # opened with a service token. The VM itself stays off the internet.
+      - name: Connect to the on-prem network (cloudflared)
+        if: inputs.test_local != true
+        env:
+          SSH_KEY: ${{ secrets.ONPREM_SSH_PRIVATE_KEY }}
+        run: |
+          echo "온프레미스 네트워크(cloudflared)에 연결하지 못했습니다." > "$REASONS/deploy.txt"
+          # ponytail: latest release; pin a version once the on-prem setup is fixed.
+          curl -fsSL -o "$RUNNER_TEMP/cloudflared.deb" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "$RUNNER_TEMP/cloudflared.deb"
+          [[ -n "$SSH_KEY" ]] || { echo "::error::ONPREM_SSH_PRIVATE_KEY is empty"; exit 1; }
+          printf '%s\n' "$SSH_KEY" > "$PDD/env/ssh_key"
+          chmod 600 "$PDD/env/ssh_key"
+          rm "$REASONS/deploy.txt"
+
+      # Each Ansible task is reported as it starts and finishes, so the resource tree moves like a Terraform apply.
+      # The playbook ends by calling the app's health check path on the VM.
+      - name: Run playbook (Ansible Runner)
+        env:
+          TUNNEL_SERVICE_TOKEN_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          TUNNEL_SERVICE_TOKEN_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+        run: |
+          echo "VM에 앱을 설치하지 못했습니다(Ansible)." > "$REASONS/deploy.txt"
+          ansible-runner run "$PDD" -p deploy.yml --json | python3 scripts/callback.py ansible-events
+          rm "$REASONS/deploy.txt"
+
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reason-deploy
+          path: ${{ github.workspace }}/reasons/
+          if-no-files-found: ignore
+
+  # Always sends the final result, including failures and cancellations.
+  report:
+    needs: [prepare, build, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: reason-*
+          merge-multiple: true
+          path: reasons
+
+      - name: Report final result
+        env:
+          DEPLOY_CALLBACK_SECRET: ${{ secrets.DEPLOY_CALLBACK_SECRET }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          APP_URL: ${{ needs.deploy.outputs.app_url }}
+          REASONS_DIR: reasons
+        run: python3 scripts/callback.py final
