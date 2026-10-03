@@ -32,7 +32,6 @@ concurrency:
 
 env:
   AWS_REGION: ap-northeast-2
-  WORKLOAD_ACCOUNT_ID: "921810471078"
   API_BASE: https://sbh.howon.me/api
 
 # Each risky step writes its failure reason first and removes it on success (same as Deploy).
@@ -59,19 +58,50 @@ jobs:
           fi
           rm "$REASONS/destroy.txt"
 
+      # Destroy gets only the app ID, so it looks for the app's state: first in Workload, then in Sandbox (plan.py ACCOUNTS).
+      - name: Look up Workload
+        id: workload
+        run: python3 scripts/plan.py account workload >> "$GITHUB_OUTPUT"
+
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-access-key-id: ${{ secrets.WORKLOAD_AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.WORKLOAD_AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ env.WORKLOAD_ACCOUNT_ID }}
+          allowed-account-ids: ${{ steps.workload.outputs.account_id }}
+
+      - name: Find the app's account
+        id: find
+        env:
+          WORKLOAD_BUCKET: ${{ steps.workload.outputs.bucket }}
+        run: |
+          # Kept if the Sandbox keys are missing or the state is in neither account; Load saved variables clears it.
+          echo "이 앱의 배포 기록(State)을 찾지 못했습니다." > "$REASONS/destroy.txt"
+          # Only a confirmed "not found" moves on to Sandbox. Any other error stops, so an outage or missing permission
+          # in Workload never makes Destroy act on a same-named app in another account.
+          if ERR=$(aws s3api head-object --bucket "$WORKLOAD_BUCKET" --key "apps/$APPLICATION_ID/template" 2>&1 >/dev/null); then
+            python3 scripts/plan.py account workload >> "$GITHUB_OUTPUT"
+          elif grep -qE '\(404\)|Not Found' <<< "$ERR"; then
+            python3 scripts/plan.py account sandbox >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not check the Workload state bucket: $ERR"; exit 1
+          fi
+
+      - if: steps.find.outputs.name == 'sandbox'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.SANDBOX_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SANDBOX_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ steps.find.outputs.account_id }}
 
       # Deploy saved the variables and template name next to the state.
       - name: Load saved variables
         id: saved
+        env:
+          BUCKET: ${{ steps.find.outputs.bucket }}
         run: |
           echo "이 앱의 배포 기록(State)을 찾지 못했습니다." > "$REASONS/destroy.txt"
-          BUCKET="sbh-workload-demo-s3-tfstate-${WORKLOAD_ACCOUNT_ID}"
           aws s3 cp "s3://$BUCKET/apps/$APPLICATION_ID/app.tfvars.json" "$RUNNER_TEMP/app.tfvars.json"
           TEMPLATE=$(aws s3 cp "s3://$BUCKET/apps/$APPLICATION_ID/template" -)
           [[ "$TEMPLATE" =~ ^[a-z0-9-]+/[a-z0-9-]+$ && -d "templates/$TEMPLATE" ]] || { echo "::error::unknown template $TEMPLATE"; exit 1; }

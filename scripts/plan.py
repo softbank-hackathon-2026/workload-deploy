@@ -7,7 +7,8 @@ The pipeline's own values (application_id, deployment_id, infra_id, image) are a
 so plan values with those names are dropped and cannot override them.
 
 Usage:
-  plan.py <tfvars.json>      # writes the variables file, prints the template name (e.g. ecs-fargate/basic)
+  plan.py target <plan.json> # fetches the plan once, saves it, prints the target account as step outputs
+  plan.py <tfvars.json>      # writes the variables file (from PLAN_FILE if set), prints the template name
   plan.py --self-test
 """
 import json
@@ -30,6 +31,15 @@ INFRA_NEEDS = {
     "lambda/basic": {},
     "ec2/basic": {"vpc_id": 0, "public_subnet_ids": 1},
 }
+# AWS accounts an app can be deployed to. The Infra Space names its account in infra.aws_account_id (default Workload);
+# the workflow picks the matching keys (<secrets>_AWS_ACCESS_KEY_ID), state bucket and image repository from here.
+ACCOUNTS = {
+    "921810471078": {"name": "workload", "secrets": "WORKLOAD", "bucket": "sbh-workload-demo-s3-tfstate-921810471078",
+                     "ecr": "sbh-workload-demo-ecr-apps"},
+    "635738234799": {"name": "sandbox", "secrets": "SANDBOX", "bucket": "sbh-sandbox-s3-tfstate-635738234799",
+                     "ecr": "sbh-sandbox-ecr-apps"},
+}
+DEFAULT_ACCOUNT = "921810471078"
 RESERVED = {"application_id", "deployment_id", "infra_id", "image", "region"}
 TEMPLATE_PATTERN = re.compile(r"^[a-z0-9-]+/[a-z0-9-]+$")
 
@@ -41,6 +51,16 @@ def fetch_plan(api_base, plan_id, secret):
     )
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.load(r)
+
+
+def target(plan):
+    """The account this plan deploys to, from infra.aws_account_id. Only accounts listed in ACCOUNTS are allowed."""
+    infra = plan.get("infra") or {}
+    # Default only when the field is absent; an empty or wrong value is refused rather than sent to Workload.
+    account_id = infra["aws_account_id"] if "aws_account_id" in infra else DEFAULT_ACCOUNT
+    if not isinstance(account_id, str) or account_id not in ACCOUNTS:
+        raise ValueError(f"배포할 수 없는 AWS 계정입니다: {account_id}")
+    return {"account_id": account_id, **ACCOUNTS[account_id]}
 
 
 def build(plan, compute, templates_dir, pipeline, exposed_port=None):
@@ -136,40 +156,75 @@ def self_test():
         else:
             raise AssertionError("one subnet must be rejected")
 
+    # Target account: Workload by default, Sandbox when the Space says so, anything else refused.
+    assert target({})["name"] == "workload"
+    sandbox = target({"infra": {"aws_account_id": "635738234799"}})
+    assert (sandbox["secrets"], sandbox["bucket"]) == ("SANDBOX", "sbh-sandbox-s3-tfstate-635738234799"), sandbox
+    for bad in ("123456789012", "", 0, None, 635738234799):
+        try:
+            target({"infra": {"aws_account_id": bad}})
+        except ValueError:
+            continue
+        raise AssertionError(f"account {bad!r} must be rejected")
+
     print("self-test ok")
+
+
+def load_plan():
+    """The backend plan (PLAN_ID), or TEST_PLAN for a manual run."""
+    plan_id = os.environ.get("PLAN_ID", "")
+    if plan_id:
+        try:
+            return fetch_plan(os.environ["API_BASE"], plan_id, os.environ.get("DEPLOY_CALLBACK_SECRET", ""))
+        except OSError as e:
+            raise ValueError(f"백엔드에서 구성안({plan_id})을 받지 못했습니다: {e}") from e
+    try:
+        plan = json.loads(os.environ.get("TEST_PLAN") or "{}")
+    except json.JSONDecodeError as e:
+        raise ValueError("test_plan이 올바른 JSON이 아닙니다.") from e
+    if not isinstance(plan, dict):
+        raise ValueError("test_plan은 JSON 객체여야 합니다.")
+    return plan
+
+
+def fail(e):
+    print(f"::error::{e}", file=sys.stderr)
+    if os.environ.get("REASON_FILE"):
+        Path(os.environ["REASON_FILE"]).write_text(str(e), encoding="utf-8")
+    sys.exit(1)
 
 
 def main():
     if sys.argv[1:] == ["--self-test"]:
         return self_test()
+    # target <plan.json>: fetch the plan once, save it, print the target account as GitHub step outputs.
+    # account <name>: the same step outputs for a known account name, for Destroy (it has no plan).
+    if sys.argv[1:2] == ["account"]:
+        account_id = next(k for k, v in ACCOUNTS.items() if v["name"] == sys.argv[2])
+        print("\n".join(f"{k}={v}" for k, v in {"account_id": account_id, **ACCOUNTS[account_id]}.items()))
+        return
+    if sys.argv[1:2] == ["target"]:
+        try:
+            plan = load_plan()
+            t = target(plan)
+        except ValueError as e:
+            fail(e)
+        Path(sys.argv[2]).write_text(json.dumps(plan), encoding="utf-8")
+        print("\n".join(f"{k}={v}" for k, v in t.items()))
+        return
     pipeline = {
         "application_id": os.environ["APPLICATION_ID"],
         "deployment_id": os.environ["DEPLOYMENT_ID"],
         "infra_id": os.environ["INFRA_ID"],
         "image": os.environ["IMAGE"],
     }
-    plan_id = os.environ.get("PLAN_ID", "")
     try:
-        if plan_id:
-            try:
-                plan = fetch_plan(os.environ["API_BASE"], plan_id, os.environ.get("DEPLOY_CALLBACK_SECRET", ""))
-            except OSError as e:
-                raise ValueError(f"백엔드에서 구성안({plan_id})을 받지 못했습니다: {e}") from e
-        else:
-            try:
-                plan = json.loads(os.environ.get("TEST_PLAN") or "{}")
-            except json.JSONDecodeError as e:
-                raise ValueError("test_plan이 올바른 JSON이 아닙니다.") from e
-            if not isinstance(plan, dict):
-                raise ValueError("test_plan은 JSON 객체여야 합니다.")
+        plan = json.loads(Path(os.environ["PLAN_FILE"]).read_text(encoding="utf-8")) if os.environ.get("PLAN_FILE") else load_plan()
         exposed = os.environ.get("EXPOSED_PORT", "")
         exposed_port = int(exposed) if exposed.isdigit() and 1 <= int(exposed) <= 65535 else None
         out = build(plan, os.environ["COMPUTE"], os.environ.get("TEMPLATES_DIR", "templates"), pipeline, exposed_port)
     except ValueError as e:
-        print(f"::error::{e}", file=sys.stderr)
-        if os.environ.get("REASON_FILE"):
-            Path(os.environ["REASON_FILE"]).write_text(str(e), encoding="utf-8")
-        sys.exit(1)
+        fail(e)
     Path(sys.argv[1]).write_text(json.dumps(out["vars"]), encoding="utf-8")
     print(out["template"])
 

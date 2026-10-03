@@ -54,8 +54,6 @@ concurrency:
 
 env:
   AWS_REGION: ap-northeast-2
-  WORKLOAD_ACCOUNT_ID: "921810471078"
-  ECR_REPOSITORY: sbh-workload-demo-ecr-apps
   API_BASE: https://sbh.howon.me/api
   CALLBACK_BASE: https://sbh.howon.me/api/deployments/
   DEPLOYMENT_ID: ${{ inputs.deployment_id }}
@@ -186,32 +184,44 @@ jobs:
           name: image
           path: ${{ runner.temp }}
 
-      # Keys issued by the infra owner for the Workload account (ADR-009). Any other account is refused.
+      # The plan says which account the Infra Space lives in (infra.aws_account_id, default Workload). Fetched once here
+      # and reused below, so the keys, state bucket and image repository all match that account (plan.py ACCOUNTS).
+      - name: Choose target account
+        id: target
+        env:
+          PLAN_ID: ${{ inputs.plan_id }}
+          TEST_PLAN: ${{ inputs.test_plan }}
+          REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
+        run: python3 scripts/plan.py target "$RUNNER_TEMP/plan.json" >> "$GITHUB_OUTPUT"
+
+      # Keys issued by the infra owner for each account (ADR-009). Any account other than the chosen one is refused.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          aws-access-key-id: ${{ secrets.WORKLOAD_AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.WORKLOAD_AWS_SECRET_ACCESS_KEY }}
+          aws-access-key-id: ${{ steps.target.outputs.secrets == 'SANDBOX' && secrets.SANDBOX_AWS_ACCESS_KEY_ID || secrets.WORKLOAD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ steps.target.outputs.secrets == 'SANDBOX' && secrets.SANDBOX_AWS_SECRET_ACCESS_KEY || secrets.WORKLOAD_AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
-          allowed-account-ids: ${{ env.WORKLOAD_ACCOUNT_ID }}
+          allowed-account-ids: ${{ steps.target.outputs.account_id }}
 
       # ponytail: created on first use with the CLI instead of a separate bootstrap stack. Idempotent.
       - name: Prepare state bucket and image repository
         id: base
+        env:
+          BUCKET: ${{ steps.target.outputs.bucket }}
+          ECR_REPOSITORY: ${{ steps.target.outputs.ecr }}
+          SCOPE: ${{ steps.target.outputs.name }}
         run: |
-          echo "Workload 기본 자원(State 버킷, 이미지 저장소)을 준비하지 못했습니다." > "$REASONS/deploy.txt"
-          BUCKET="sbh-workload-demo-s3-tfstate-${WORKLOAD_ACCOUNT_ID}"
-          TAGS="Project=SBH,Scope=workload,Environment=demo,ManagedBy=github-actions,Owner=박소정"
+          echo "배포 계정($SCOPE)의 기본 자원(State 버킷, 이미지 저장소)을 준비하지 못했습니다." > "$REASONS/deploy.txt"
           if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
             aws s3api create-bucket --bucket "$BUCKET" --create-bucket-configuration LocationConstraint="$AWS_REGION"
             aws s3api put-public-access-block --bucket "$BUCKET" --public-access-block-configuration \
               BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
             aws s3api put-bucket-versioning --bucket "$BUCKET" --versioning-configuration Status=Enabled
             aws s3api put-bucket-tagging --bucket "$BUCKET" --tagging \
-              "TagSet=[{Key=Name,Value=$BUCKET},{Key=Project,Value=SBH},{Key=Scope,Value=workload},{Key=Environment,Value=demo},{Key=ManagedBy,Value=github-actions},{Key=Owner,Value=박소정}]"
+              "TagSet=[{Key=Name,Value=$BUCKET},{Key=Project,Value=SBH},{Key=Scope,Value=$SCOPE},{Key=Environment,Value=demo},{Key=ManagedBy,Value=github-actions},{Key=Owner,Value=박소정}]"
           fi
           if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" >/dev/null 2>&1; then
             aws ecr create-repository --repository-name "$ECR_REPOSITORY" --image-tag-mutability IMMUTABLE \
-              --tags "Key=Name,Value=$ECR_REPOSITORY" Key=Project,Value=SBH Key=Scope,Value=workload \
+              --tags "Key=Name,Value=$ECR_REPOSITORY" Key=Project,Value=SBH "Key=Scope,Value=$SCOPE" \
                 Key=Environment,Value=demo Key=ManagedBy,Value=github-actions "Key=Owner,Value=박소정" >/dev/null
           fi
           echo "bucket=$BUCKET" >> "$GITHUB_OUTPUT"
@@ -221,9 +231,12 @@ jobs:
       # Lambda images carry the adapter, so they get their own tag.
       - name: Push image
         id: image
+        env:
+          ECR_REPOSITORY: ${{ steps.target.outputs.ecr }}
+          ACCOUNT_ID: ${{ steps.target.outputs.account_id }}
         run: |
-          echo "이미지를 Workload 이미지 저장소에 올리지 못했습니다." > "$REASONS/deploy.txt"
-          REGISTRY="${WORKLOAD_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "이미지를 배포 계정의 이미지 저장소에 올리지 못했습니다." > "$REASONS/deploy.txt"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           TAG="${APPLICATION_ID}-${COMMIT_SHA}"
           [[ "$COMPUTE" == "lambda" ]] && TAG="$TAG-lambda"
           if ! aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
@@ -242,8 +255,7 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.image }}
           EXPOSED_PORT: ${{ needs.build.outputs.exposed_port }}
-          PLAN_ID: ${{ inputs.plan_id }}
-          TEST_PLAN: ${{ inputs.test_plan }}
+          PLAN_FILE: ${{ runner.temp }}/plan.json
           REASON_FILE: ${{ github.workspace }}/reasons/deploy.txt
         run: |
           TEMPLATE=$(python3 scripts/plan.py "$RUNNER_TEMP/app.tfvars.json")

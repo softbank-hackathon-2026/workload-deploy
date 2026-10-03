@@ -54,7 +54,19 @@ deploy 단계에서 `status=deploying`, `step=deploy`와 함께 `resources` 배�
 | 이름 | 용도 | 상태 |
 |---|---|---|
 | `DEPLOY_CALLBACK_SECRET` | 콜백 서명 키. 플랫폼 Parameter Store `/sbh/platform/demo/backend/DEPLOY_CALLBACK_SECRET`와 같은 값 | 등록됨 (2026-10-02) |
-| `WORKLOAD_AWS_ACCESS_KEY_ID`, `WORKLOAD_AWS_SECRET_ACCESS_KEY` | Workload 계정 키(정호원님 발급). deploy·destroy에서만 사용, 계정 `921810471078`이 아니면 멈춤 | 미등록 |
+| `WORKLOAD_AWS_ACCESS_KEY_ID`, `WORKLOAD_AWS_SECRET_ACCESS_KEY` | Workload 계정 키(정호원님 발급). deploy·destroy에서만 사용, 계정 `921810471078`이 아니면 멈춤 | 등록됨 (2026-10-02) |
+| `SANDBOX_AWS_ACCESS_KEY_ID`, `SANDBOX_AWS_SECRET_ACCESS_KEY` | Sandbox 계정 키(정호원님 발급). 구성안 `infra.aws_account_id`가 `635738234799`일 때만 사용, 그 계정이 아니면 멈춤 | 미등록 |
+
+## 배포 계정
+
+구성안 `infra.aws_account_id`로 배포할 계정을 고릅니다. 없으면 Workload입니다. 목록에 없는 계정은 거절합니다(`scripts/plan.py`의 `ACCOUNTS`).
+
+| 계정 | 번호 | State 버킷 | 이미지 저장소 |
+|---|---|---|---|
+| Workload | `921810471078` | `sbh-workload-demo-s3-tfstate-921810471078` | `sbh-workload-demo-ecr-apps` |
+| Sandbox | `635738234799` | `sbh-sandbox-s3-tfstate-635738234799` | `sbh-sandbox-ecr-apps` |
+
+버킷과 저장소는 그 계정에 처음 배포할 때 자동으로 만듭니다. 내리기(destroy)는 앱 ID만 받으므로 Workload 버킷에서 앱 기록을 먼저 찾고, 없으면 Sandbox에서 찾습니다.
 
 ## 진행 상황
 
