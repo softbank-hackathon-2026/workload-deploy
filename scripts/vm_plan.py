@@ -1,6 +1,6 @@
 """Check the on-prem plan values (values.yaml) and write the Ansible Runner inputs for one VM deploy.
 
-Two computes: vm (the code is built and run on the VM itself, playbooks/deploy.yml) and vm-container
+Two computes: onprem (the code is built and run on the VM itself, playbooks/deploy.yml) and onprem-container
 (the repo's Dockerfile is built and run with Docker on the VM, playbooks/deploy-container.yml).
 
 The plan comes from the backend the same way as for AWS (plan.py load_plan: signed GET /api/plans/{plan_id},
@@ -38,7 +38,7 @@ DEFAULTS = {
     "env": {},
 }
 CONTAINER_DEFAULTS = {"container_port": 8080, "health_check_path": "/", "env": {}}
-PLAYBOOKS = {"vm": "deploy.yml", "vm-container": "deploy-container.yml"}
+PLAYBOOKS = {"onprem": "deploy.yml", "onprem-container": "deploy-container.yml"}
 PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{0,254}$")
 ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -77,7 +77,7 @@ def check_common(v):
 
 
 def check_container_values(raw):
-    """vm-container: the repo's Dockerfile runs as a container, app_port on the VM -> container_port inside."""
+    """onprem-container: the repo's Dockerfile runs as a container, app_port on the VM -> container_port inside."""
     v = {**CONTAINER_DEFAULTS, **known(raw, {*CONTAINER_DEFAULTS, "app_port"})}
     check_port("container_port", v["container_port"], 1)
     v.setdefault("app_port", v["container_port"] if v["container_port"] >= 1024 else 8080)
@@ -182,17 +182,17 @@ def main():
     app_id = os.environ["APPLICATION_ID"]
     try:
         if mode == "prepare":
-            compute = os.environ.get("COMPUTE") or "vm"
+            compute = os.environ.get("COMPUTE") or "onprem"
             if compute not in PLAYBOOKS:
-                raise ValueError(f"compute {compute}는 온프레미스에서 지원하지 않습니다(vm, vm-container).")
+                raise ValueError(f"compute {compute}는 온프레미스에서 지원하지 않습니다(onprem, onprem-container).")
             plan = load_plan()
-            check = check_container_values if compute == "vm-container" else check_values
+            check = check_container_values if compute == "onprem-container" else check_values
             values = check(plan.get("values"))
             host = "127.0.0.1" if local else (plan.get("infra") or {}).get("vm_host")
             inv = inventory(host, user, local)
             extravars = {**values, "application_id": app_id, "deployment_id": os.environ["DEPLOYMENT_ID"],
                          "app_archive": os.environ["APP_ARCHIVE"]}
-            tomcat = compute == "vm" and values["runtime"] == "java" and values["java_server"] == "tomcat"
+            tomcat = compute == "onprem" and values["runtime"] == "java" and values["java_server"] == "tomcat"
             port = 8080 if tomcat else values["app_port"]
             write(pdd, extravars, inv)
             print(f"app_url=http://{host}:{port}")

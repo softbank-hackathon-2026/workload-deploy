@@ -26,9 +26,9 @@ on:
         description: On-prem Infra Space ID
         required: true
       compute:
-        description: vm (build and run the code on the VM) or vm-container (build and run the Dockerfile with Docker)
+        description: onprem (build and run the code on the VM) or onprem-container (build and run the Dockerfile with Docker)
         required: false
-        default: vm
+        default: onprem
       plan_id:
         description: Plan with values.yaml and the target VM. Empty uses test_plan.
         required: false
@@ -81,7 +81,7 @@ jobs:
           COMPUTE: ${{ inputs.compute }}
         run: |
           fail() { echo "::error::$1"; exit 1; }
-          [[ "$COMPUTE" =~ ^(vm|vm-container)$ ]] || fail "compute must be vm or vm-container"
+          [[ "$COMPUTE" =~ ^(onprem|onprem-container)$ ]] || fail "compute must be onprem or onprem-container"
           [[ "$DEPLOYMENT_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "deployment_id must be lowercase letters, digits and hyphens"
           [[ "$APPLICATION_ID" =~ ^[a-z0-9-]{1,24}$ ]] || fail "application_id must be 1-24 lowercase letters, digits and hyphens"
           [[ "$INFRA_ID" =~ ^[a-z0-9-]{1,64}$ ]] || fail "infra_id must be lowercase letters, digits and hyphens"

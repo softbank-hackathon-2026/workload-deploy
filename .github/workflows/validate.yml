@@ -42,10 +42,10 @@ jobs:
     strategy:
       matrix:
         app:
-          - { name: python, dir: python, compute: vm, port: 8080, start: "python3 app.py" }
-          - { name: node, dir: node, compute: vm, port: 8080, start: "node server.js" }
+          - { name: python, dir: python, compute: onprem, port: 8080, start: "python3 app.py" }
+          - { name: node, dir: node, compute: onprem, port: 8080, start: "node server.js" }
           # Dockerfile build and run; host port 8081 -> container 8080 checks the port mapping.
-          - { name: container, dir: python, compute: vm-container, port: 8081, start: "" }
+          - { name: container, dir: python, compute: onprem-container, port: 8081, start: "" }
     defaults:
       run:
         shell: bash
@@ -84,7 +84,7 @@ jobs:
           cp -r ansible/playbooks "$PDD/project"
           ansible-runner run "$PDD" -p "$playbook" --json | python3 scripts/callback.py ansible-events
           curl -fsS "http://127.0.0.1:${{ matrix.app.port }}/health"
-          if [[ "$COMPUTE" == vm-container ]]; then
+          if [[ "$COMPUTE" == onprem-container ]]; then
             sudo docker exec "sbh-app-$APPLICATION_ID" env | grep -q "APP_ENV=check"
           else
             systemctl show "sbh-app-$APPLICATION_ID" -p Environment | grep -q "APP_ENV=check"
