@@ -1,4 +1,4 @@
-# Removes one app from the on-prem service VM (destroy-vm.yml), whether it was deployed as vm or vm-container.
+# Removes one app from the on-prem service VM (destroy-vm.yml), whether it was deployed as onprem or onprem-container.
 # Runtime packages, Tomcat and Docker stay for other apps.
 - name: Remove app
   hosts: target
@@ -37,7 +37,7 @@
         state: absent
       when: tomcat.content is defined
 
-    # vm-container apps. Fails quietly when the app was not a container or Docker is not installed.
+    # onprem-container apps. Fails quietly when the app was not a container or Docker is not installed.
     - name: Remove app container
       ansible.builtin.command:
         argv: [docker, rm, -f, "{{ service_name }}"]

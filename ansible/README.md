@@ -8,13 +8,13 @@
 
 | 컴퓨팅 ID | 방식 | 플레이북 | AI가 추천할 때 |
 |---|---|---|---|
-| `vm` | 코드를 VM에 올려 VM에서 빌드하고 systemd 서비스로 실행. Docker 안 씀 | `playbooks/deploy.yml` | Dockerfile이 없는 Python·Node·Java 앱 |
-| `vm-container` | 레포의 Dockerfile로 VM에서 이미지를 빌드하고 Docker 컨테이너로 실행 | `playbooks/deploy-container.yml` | Dockerfile이 있는 앱 (언어 무관) |
+| `onprem` | 코드를 VM에 올려 VM에서 빌드하고 systemd 서비스로 실행. Docker 안 씀 | `playbooks/deploy.yml` | Dockerfile이 없는 Python·Node·Java 앱 |
+| `onprem-container` | 레포의 Dockerfile로 VM에서 이미지를 빌드하고 Docker 컨테이너로 실행 | `playbooks/deploy-container.yml` | Dockerfile이 있는 앱 (언어 무관) |
 
 ## 흐름
 
 ```
-백엔드 (compute = vm 또는 vm-container)
+백엔드 (compute = onprem 또는 onprem-container)
   → deploy-vm.yml 실행 (deploy.yml과 같은 입력)
   → prepare: 입력 검사, 진행 알림
   → build:   사용자 코드를 묶기만 함 (키 없음)
@@ -28,27 +28,27 @@
 
 | 파일 | 역할 |
 |---|---|
-| `playbooks/deploy.yml` | `vm`: 언어 설치 → 앱 사용자 만들기 → 코드 복사 → 빌드 → systemd 서비스 등록·시작 → 헬스체크 |
-| `playbooks/deploy-container.yml` | `vm-container`: Docker 설치(없을 때만) → 코드 복사 → 이미지 빌드 → 이전 컨테이너 교체 → 헬스체크 |
+| `playbooks/deploy.yml` | `onprem`: 언어 설치 → 앱 사용자 만들기 → 코드 복사 → 빌드 → systemd 서비스 등록·시작 → 헬스체크 |
+| `playbooks/deploy-container.yml` | `onprem-container`: Docker 설치(없을 때만) → 코드 복사 → 이미지 빌드 → 이전 컨테이너 교체 → 헬스체크 |
 | `playbooks/remove.yml` | 두 컴퓨팅 공통. 서비스·컨테이너·이미지·앱 파일 삭제. 언어, Tomcat, Docker는 다른 앱을 위해 남김 |
 | `playbooks/templates/app.service.j2` | 앱 systemd 서비스 (포트, 환경변수, 시작 명령) |
 | `../scripts/vm_plan.py` | values.yaml 검사, Ansible 변수와 대상 VM 목록 작성 |
 
 ## 입력 속성
 
-### AI가 채울 값: `vm-container`
+### AI가 채울 값: `onprem-container`
 
 | 속성 | 타입 | 필수 | 기본값 | 허용 범위 | 역할 |
 |---|---|---|---|---|---|
 | `container_port` | number | | `8080` | 1~65535 정수 | 컨테이너 안에서 앱이 듣는 포트 (Dockerfile `EXPOSE`). 컨테이너에 `PORT` 환경변수로도 넣음 |
 | `app_port` | number | | `container_port` (1024 미만이면 `8080`) | 1024~65535 정수 | VM에서 여는 포트. `app_port` → `container_port`로 연결 |
-| `health_check_path` | string | | `/` | `vm`과 같음 | 배포 끝에 VM 안에서 `app_port`로 불러 2xx·3xx면 성공 |
-| `env` | object | | `{}` | `vm`과 같음 | 컨테이너 환경변수. **비밀값은 넣지 않음** |
+| `health_check_path` | string | | `/` | `onprem`과 같음 | 배포 끝에 VM 안에서 `app_port`로 불러 2xx·3xx면 성공 |
+| `env` | object | | `{}` | `onprem`과 같음 | 컨테이너 환경변수. **비밀값은 넣지 않음** |
 
 - Dockerfile은 레포 맨 위에 있어야 합니다. 빌드 명령과 시작 명령은 Dockerfile이 정하므로 `build_command`, `start_command`, `runtime`은 쓰지 않습니다.
 - ECS 템플릿의 `container_port`, `health_check_path`와 같은 이름이라 AI가 같은 방식으로 채우면 됩니다.
 
-### AI가 채울 값: `vm` (구성안 `values`)
+### AI가 채울 값: `onprem` (구성안 `values`)
 
 `scripts/vm_plan.py`가 이 기준으로 검사하고, 틀리면 VM에 닿기 전에 배포를 멈춥니다.
 
@@ -90,13 +90,13 @@
 
 ## 예시 values.yaml
 
-vm-container (Dockerfile이 있는 앱, 예: sample-shop `EXPOSE 3000`)
+onprem-container (Dockerfile이 있는 앱, 예: sample-shop `EXPOSE 3000`)
 ```yaml
 container_port: 3000
 health_check_path: /health
 ```
 
-vm, Node.js (실제 VM에서 확인한 값, shop-api)
+onprem, Node.js (실제 VM에서 확인한 값, shop-api)
 ```yaml
 runtime: node
 app_port: 8080
@@ -142,7 +142,7 @@ health_check_path: /
 | 앱 폴더 | `/opt/sbh-apps/<application_id>` (재배포 때 지우고 새로 만듦) |
 | 서비스 | `sbh-app-<application_id>` (systemd, 자동 재시작) |
 | Tomcat 기록 | `/var/lib/sbh-apps/<application_id>.tomcat` (WAR일 때만, 내리기 때 사용) |
-| 컨테이너 (`vm-container`) | 이름 `sbh-app-<application_id>`, 이미지 `sbh-app-<application_id>:latest`, 꺼지면 자동 재시작 |
+| 컨테이너 (`onprem-container`) | 이름 `sbh-app-<application_id>`, 이미지 `sbh-app-<application_id>:latest`, 꺼지면 자동 재시작 |
 | 컨테이너 환경변수 파일 | `/opt/sbh-apps/<application_id>.env` (root만 읽기) |
 
 화면 자원 트리에는 Ansible 작업이 `type: ansible_task`, `address: <작업 이름>`으로 나옵니다 (예: `Install Node.js runtime`, `Start app service`).
@@ -159,11 +159,11 @@ GitHub Actions가 Cloudflare Access(서비스 토큰)를 거쳐 VM에 SSH로 들
 
 ## 워크플로 입력
 
-- `deploy-vm.yml`: `deployment_id`, `application_id`, `repo`, `commit_sha`, `infra_id`, `compute`(`vm` 또는 `vm-container`, 비우면 `vm`), `plan_id`, `callback_url` (deploy.yml과 같음). 시험용 `test_plan`, `test_local`.
+- `deploy-vm.yml`: `deployment_id`, `application_id`, `repo`, `commit_sha`, `infra_id`, `compute`(`onprem` 또는 `onprem-container`, 비우면 `onprem`), `plan_id`, `callback_url` (deploy.yml과 같음). 시험용 `test_plan`, `test_local`.
 - `destroy-vm.yml`: `application_id`, `confirm`, `vm_host`, `callback_url`. 시험용 `test_local`.
 
 ## 검사와 시험 기록
 
-- `Validate` 워크플로의 `vm-playbook` job이 Actions 러너를 VM 대신 써서 Python·Node(`vm`)와 Dockerfile 앱(`vm-container`)을 배포 → 응답 → 삭제까지 확인합니다.
+- `Validate` 워크플로의 `vm-playbook` job이 Actions 러너를 VM 대신 써서 Python·Node(`onprem`)와 Dockerfile 앱(`onprem-container`)을 배포 → 응답 → 삭제까지 확인합니다.
 - 2026-10-03 실제 VM(`vpn.howon.me`): shop-api(Node) 배포 2분 20초 성공, 내리기 53초 성공.
 - Java JAR와 Tomcat WAR는 플레이북에 있지만 실제 VM 시험은 아직입니다.
